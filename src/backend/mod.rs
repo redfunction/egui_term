@@ -17,6 +17,7 @@ use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
 use alacritty_terminal::tty;
+use alacritty_terminal::vte::ansi::Processor;
 use egui::Modifiers;
 use settings::BackendSettings;
 use std::borrow::Cow;
@@ -25,7 +26,7 @@ use std::io::Result;
 use std::ops::{Index, RangeInclusive};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 pub type TerminalMode = TermMode;
 pub type PtyEvent = Event;
@@ -135,13 +136,50 @@ impl From<TerminalSize> for WindowSize {
     }
 }
 
+enum Sink {
+    EventLoop { notifier: Notifier },
+    Channel {
+        input_tx: mpsc::Sender<Vec<u8>>,
+        resize_tx: mpsc::Sender<WindowSize>,
+    },
+}
+
+impl Sink {
+    fn notify<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
+        match self {
+            Sink::EventLoop { notifier } => notifier.notify(input),
+            Sink::Channel { input_tx, .. } => {
+                let _ = input_tx.send(input.into().into_owned());
+            }
+        }
+    }
+
+    fn on_resize(&mut self, size: WindowSize) {
+        match self {
+            Sink::EventLoop { notifier } => notifier.on_resize(size),
+            Sink::Channel { resize_tx, .. } => {
+                let _ = resize_tx.send(size);
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            Sink::EventLoop { notifier } => {
+                let _ = notifier.0.send(Msg::Shutdown);
+            }
+            Sink::Channel { .. } => {}
+        }
+    }
+}
+
 pub struct TerminalBackend {
     id: u64,
     pty_id: u32,
     url_regex: RegexSearch,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
-    notifier: Notifier,
+    sink: Sink,
     last_content: RenderableContent,
     dirty: Arc<AtomicBool>,
 }
@@ -216,7 +254,7 @@ impl TerminalBackend {
             url_regex,
             term: term.clone(),
             size: terminal_size,
-            notifier,
+            sink: Sink::EventLoop { notifier },
             last_content: initial_content,
             dirty,
         })
@@ -232,7 +270,7 @@ impl TerminalBackend {
         app_context: egui::Context,
         pty_event_proxy_sender: Sender<(u64, PtyEvent)>,
     ) -> Result<(Self, StreamHandle)> {
-        let (stream_a, stream_b) = std::os::unix::net::UnixStream::pair()?;
+        let (stream_a, stream_b) = crate::socket_pty::tcp_stream_pair()?;
         let (resize_tx, resize_rx) = std::sync::mpsc::channel();
         let socket_pty = SocketPty::new(stream_a, resize_tx);
 
@@ -288,7 +326,93 @@ impl TerminalBackend {
                 url_regex,
                 term: term.clone(),
                 size: terminal_size,
-                notifier,
+                sink: Sink::EventLoop { notifier },
+                last_content: initial_content,
+                dirty,
+            },
+            handle,
+        ))
+    }
+
+    /// Create a backend that writes directly to the terminal grid,
+    /// with no socket, no EventLoop, and no Notifier.
+    ///
+    /// Returns `(TerminalBackend, DirectHandle)` where `DirectHandle` contains
+    /// a `DirectWriter` for feeding data into the grid, plus receivers for
+    /// user input and resize events.
+    pub fn new_direct(
+        id: u64,
+        app_context: egui::Context,
+        pty_event_proxy_sender: Sender<(u64, PtyEvent)>,
+    ) -> Result<(Self, DirectHandle)> {
+        let dirty = Arc::new(AtomicBool::new(true));
+        let config = term::Config::default();
+        let terminal_size = TerminalSize::default();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let event_proxy = EventProxy { sender: event_sender, dirty: dirty.clone() };
+        let mut term = Term::new(config, &terminal_size, event_proxy.clone());
+        let initial_content = RenderableContent {
+            display_offset: term.grid().display_offset(),
+            cursor_point: term.grid().cursor.point,
+            selectable_range: None,
+            terminal_mode: *term.mode(),
+            terminal_size,
+            cursor: term.grid_mut().cursor_cell().clone(),
+            hovered_hyperlink: None,
+        };
+        let term = Arc::new(FairMutex::new(term));
+        let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
+
+        let (input_tx, input_rx) = mpsc::channel();
+        let (resize_tx, resize_rx) = mpsc::channel();
+
+        let processor = Processor::new();
+
+        let writer = DirectWriter {
+            inner: Arc::new(DirectWriterInner {
+                term: term.clone(),
+                processor: Mutex::new(processor),
+                app_context: app_context.clone(),
+                dirty: dirty.clone(),
+            }),
+        };
+
+        // Route PtyWrite events to input_tx
+        let input_tx_for_events = input_tx.clone();
+        let _pty_event_subscription = std::thread::Builder::new()
+            .name(format!("pty_event_subscription_{}", id))
+            .spawn(move || loop {
+                if let Ok(event) = event_receiver.recv() {
+                    pty_event_proxy_sender
+                        .send((id, event.clone()))
+                        .unwrap_or_else(|_| {
+                            panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
+                        });
+                    app_context.clone().request_repaint();
+                    match event {
+                        Event::Exit => break,
+                        Event::PtyWrite(data) => {
+                            let _ = input_tx_for_events.send(data.into_bytes());
+                        }
+                        _ => {}
+                    }
+                }
+            })?;
+
+        let handle = DirectHandle {
+            writer: writer.clone(),
+            input_rx,
+            resize_rx,
+        };
+
+        Ok((
+            Self {
+                id,
+                pty_id: 0,
+                url_regex,
+                term: term.clone(),
+                size: terminal_size,
+                sink: Sink::Channel { input_tx, resize_tx },
                 last_content: initial_content,
                 dirty,
             },
@@ -489,7 +613,7 @@ impl TerminalBackend {
             c
         );
 
-        self.notifier.notify(msg.as_bytes().to_vec());
+        self.sink.notify(msg.as_bytes().to_vec());
     }
 
     fn normal_mouse_report(&self, point: Point, button: u8, is_utf8: bool) {
@@ -521,7 +645,7 @@ impl TerminalBackend {
             msg.push(32 + 1 + line.0 as u8);
         }
 
-        self.notifier.notify(msg);
+        self.sink.notify(msg);
     }
 
     fn start_selection(
@@ -603,7 +727,7 @@ impl TerminalBackend {
             self.size.num_lines = new_lines;
             self.size.num_cols = new_cols;
             self.dirty.store(true, Ordering::Release);
-            self.notifier.on_resize(self.size.into());
+            self.sink.on_resize(self.size.into());
             terminal.resize(TermSize::new(
                 new_cols as usize,
                 new_lines as usize,
@@ -612,7 +736,7 @@ impl TerminalBackend {
     }
 
     fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
-        self.notifier.notify(input);
+        self.sink.notify(input);
     }
 
     fn scroll(&mut self, terminal: &mut Term<EventProxy>, delta_value: i32) {
@@ -631,7 +755,7 @@ impl TerminalBackend {
                     content.push(line_cmd);
                 }
 
-                self.notifier.notify(content);
+                self.sink.notify(content);
             } else {
                 terminal.grid_mut().scroll_display(scroll);
             }
@@ -700,13 +824,57 @@ impl Default for RenderableContent {
 /// The caller uses `stream` to pipe data to/from the terminal, and
 /// `resize_rx` to receive resize events forwarded by alacritty.
 pub struct StreamHandle {
-    pub stream: std::os::unix::net::UnixStream,
+    pub stream: std::net::TcpStream,
     pub resize_rx: std::sync::mpsc::Receiver<alacritty_terminal::event::WindowSize>,
+}
+
+/// A writer that feeds bytes directly into the terminal grid,
+/// bypassing the EventLoop and socket proxy.
+pub struct DirectWriter {
+    inner: Arc<DirectWriterInner>,
+}
+
+struct DirectWriterInner {
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    processor: Mutex<Processor>,
+    app_context: egui::Context,
+    dirty: Arc<AtomicBool>,
+}
+
+impl DirectWriter {
+    /// Feed raw bytes into the terminal emulator.
+    pub fn write(&self, data: &[u8]) {
+        let mut term = self.inner.term.lock();
+        let mut processor = self.inner.processor.lock().unwrap();
+        processor.advance(&mut *term, data);
+        self.inner.dirty.store(true, Ordering::Release);
+        drop(processor);
+        drop(term);
+        self.inner.app_context.request_repaint();
+    }
+}
+
+impl Clone for DirectWriter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// Handle returned from `TerminalBackend::new_direct()`.
+///
+/// The caller uses `writer` to feed data directly into the terminal grid,
+/// `input_rx` to receive user input, and `resize_rx` to receive resize events.
+pub struct DirectHandle {
+    pub writer: DirectWriter,
+    pub input_rx: mpsc::Receiver<Vec<u8>>,
+    pub resize_rx: mpsc::Receiver<WindowSize>,
 }
 
 impl Drop for TerminalBackend {
     fn drop(&mut self) {
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        self.sink.shutdown();
     }
 }
 
