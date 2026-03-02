@@ -1,3 +1,4 @@
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point as TerminalGridPoint;
 use alacritty_terminal::term::cell;
 use alacritty_terminal::term::TermMode;
@@ -34,6 +35,9 @@ pub struct TerminalViewState {
     is_dragged: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
+    scrollbar_dragging: bool,
+    /// Y offset from click point to thumb top, so thumb doesn't snap on grab
+    scrollbar_grab_offset: f32,
 }
 
 pub struct TerminalView<'a> {
@@ -144,9 +148,15 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
-        if !layout.has_focus() || !layout.contains_pointer() {
+        let has_focus = layout.has_focus();
+        let has_pointer = layout.contains_pointer();
+
+        if !has_focus && !has_pointer {
             return self;
         }
+
+        // Scrollbar occupies the rightmost 8px of the layout
+        let scrollbar_x = layout.rect.max.x - 8.0;
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
@@ -154,10 +164,14 @@ impl<'a> TerminalView<'a> {
             let mut input_actions = vec![];
 
             match event {
+                // Keyboard events: require focus only
                 egui::Event::Text(_)
                 | egui::Event::Key { .. }
                 | egui::Event::Copy
                 | egui::Event::Paste(_) => {
+                    if !has_focus {
+                        continue;
+                    }
                     input_actions.push(process_keyboard_event(
                         event,
                         self.backend,
@@ -165,30 +179,52 @@ impl<'a> TerminalView<'a> {
                         modifiers,
                     ))
                 },
-                egui::Event::MouseWheel { unit, delta, .. } => input_actions
-                    .push(process_mouse_wheel(
+                // Mouse wheel: require pointer over widget
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    if !has_pointer {
+                        continue;
+                    }
+                    input_actions.push(process_mouse_wheel(
                         state,
                         self.font.font_type().size,
                         unit,
                         delta,
-                    )),
+                    ))
+                },
+                // Mouse button: require pointer over widget
                 egui::Event::PointerButton {
                     button,
                     pressed,
                     modifiers,
                     pos,
                     ..
-                } => input_actions.push(process_button_click(
-                    state,
-                    layout,
-                    self.backend,
-                    &self.bindings_layout,
-                    button,
-                    pos,
-                    &modifiers,
-                    pressed,
-                )),
+                } => {
+                    if !has_pointer {
+                        continue;
+                    }
+                    // Skip if clicking in scrollbar area or dragging scrollbar
+                    if pos.x >= scrollbar_x || state.scrollbar_dragging {
+                        continue;
+                    }
+                    input_actions.push(process_button_click(
+                        state,
+                        layout,
+                        self.backend,
+                        &self.bindings_layout,
+                        button,
+                        pos,
+                        &modifiers,
+                        pressed,
+                    ))
+                },
+                // Mouse move: require pointer over widget
                 egui::Event::PointerMoved(pos) => {
+                    if !has_pointer {
+                        continue;
+                    }
+                    if state.scrollbar_dragging || pos.x >= scrollbar_x {
+                        continue;
+                    }
                     input_actions = process_mouse_move(
                         state,
                         layout,
@@ -222,13 +258,20 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         painter: &Painter,
     ) {
-        let content = self.backend.sync();
+        // Single lock for both metadata sync and rendering
+        let term_arc = self.backend.term().clone();
+        let mut terminal = term_arc.lock();
+        self.backend.sync_with_term(&mut terminal);
+        let content = self.backend.last_content();
+
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
         let cell_height = content.terminal_size.cell_height as f32;
         let cell_width = content.terminal_size.cell_width as f32;
         let global_bg =
             self.theme.get_color(Color::Named(NamedColor::Background));
+        let display_offset = content.display_offset;
+        let cursor_point = content.cursor_point;
 
         let mut shapes = vec![Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
@@ -236,7 +279,7 @@ impl<'a> TerminalView<'a> {
             global_bg,
         ))];
 
-        for indexed in content.grid.display_iter() {
+        for indexed in terminal.grid().display_iter() {
             let flags = indexed.cell.flags;
             let is_wide_char_spacer =
                 flags.contains(cell::Flags::WIDE_CHAR_SPACER);
@@ -261,7 +304,7 @@ impl<'a> TerminalView<'a> {
 
             let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
             let line_num =
-                indexed.point.line.0 + content.grid.display_offset() as i32;
+                indexed.point.line.0 + display_offset as i32;
             let y = layout_min.y + (cell_height * line_num as f32);
 
             let mut fg = self.theme.get_color(indexed.fg);
@@ -284,7 +327,6 @@ impl<'a> TerminalView<'a> {
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(
                         Pos2::new(x, y),
-                        // + 1.0 is to fill grid border
                         Vec2::new(cell_width + 1., cell_height + 1.),
                     ),
                     CornerRadius::ZERO,
@@ -292,7 +334,6 @@ impl<'a> TerminalView<'a> {
                 )));
             }
 
-            // Handle hovered hyperlink underline
             if is_hovered_hyperling {
                 let underline_height = y + cell_height;
                 shapes.push(Shape::LineSegment {
@@ -304,8 +345,7 @@ impl<'a> TerminalView<'a> {
                 });
             }
 
-            // Handle cursor rendering
-            if content.grid.cursor.point == indexed.point {
+            if cursor_point == indexed.point {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(
@@ -317,9 +357,8 @@ impl<'a> TerminalView<'a> {
                 )));
             }
 
-            // Draw text content
             if indexed.c != ' ' && indexed.c != '\t' {
-                if content.grid.cursor.point == indexed.point
+                if cursor_point == indexed.point
                     && is_app_cursor_mode
                 {
                     std::mem::swap(&mut fg, &mut bg);
@@ -341,6 +380,96 @@ impl<'a> TerminalView<'a> {
             }
         }
 
+        // Scrollbar
+        let total_lines = terminal.grid().total_lines();
+        let screen_lines = terminal.grid().screen_lines();
+        let history_size = total_lines.saturating_sub(screen_lines);
+
+        if history_size > 0 {
+            let scrollbar_width = 8.0_f32;
+            let track_rect = Rect::from_min_max(
+                Pos2::new(layout_max.x - scrollbar_width, layout_min.y),
+                layout_max,
+            );
+            let track_height = track_rect.height();
+            let thumb_frac = screen_lines as f32 / total_lines as f32;
+            let thumb_height = (thumb_frac * track_height).max(20.0);
+            let scrollable_track = track_height - thumb_height;
+
+            // Thumb position: display_offset=0 → thumb at bottom, display_offset=max → thumb at top
+            let current_offset = terminal.grid().display_offset();
+            let thumb_top = if history_size > 0 {
+                let ratio = current_offset as f32 / history_size as f32;
+                // ratio=0 → bottom, ratio=1 → top
+                track_rect.min.y + (1.0 - ratio) * scrollable_track
+            } else {
+                track_rect.max.y - thumb_height
+            };
+            let thumb_rect = Rect::from_min_size(
+                Pos2::new(track_rect.min.x, thumb_top),
+                Vec2::new(scrollbar_width, thumb_height),
+            );
+
+            // Interaction
+            let pointer_pos = layout.ctx.input(|i| i.pointer.hover_pos());
+            let primary_down = layout.ctx.input(|i| i.pointer.primary_down());
+            let primary_pressed =
+                layout.ctx.input(|i| i.pointer.primary_pressed());
+
+            if let Some(pos) = pointer_pos {
+                if primary_pressed && track_rect.contains(pos) {
+                    state.scrollbar_dragging = true;
+                    if thumb_rect.contains(pos) {
+                        // Grabbing the thumb: remember offset so it doesn't snap
+                        state.scrollbar_grab_offset = pos.y - thumb_top;
+                    } else {
+                        // Clicked on track: center thumb at click
+                        state.scrollbar_grab_offset = thumb_height / 2.0;
+                    }
+                }
+
+                if state.scrollbar_dragging && primary_down {
+                    // Compute desired thumb top from pointer position
+                    let desired_thumb_top =
+                        pos.y - state.scrollbar_grab_offset;
+                    let ratio = if scrollable_track > 0.0 {
+                        1.0 - ((desired_thumb_top - track_rect.min.y)
+                            / scrollable_track)
+                            .clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let target = (ratio * history_size as f32).round() as i32;
+
+                    // Use absolute positioning: scroll to bottom then up by target
+                    terminal.scroll_display(Scroll::Bottom);
+                    if target > 0 {
+                        terminal.scroll_display(Scroll::Delta(target));
+                    }
+                    self.backend.mark_dirty();
+                }
+            }
+            if !primary_down {
+                state.scrollbar_dragging = false;
+            }
+
+            // Draw scrollbar track
+            shapes.push(Shape::Rect(RectShape::filled(
+                track_rect,
+                CornerRadius::same(4),
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+            )));
+            // Draw scrollbar thumb
+            shapes.push(Shape::Rect(RectShape::filled(
+                thumb_rect,
+                CornerRadius::same(4),
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+            )));
+        } else {
+            state.scrollbar_dragging = false;
+        }
+
+        drop(terminal);
         painter.extend(shapes);
     }
 }
@@ -610,7 +739,7 @@ fn process_mouse_move(
         cursor_x,
         cursor_y,
         &terminal_content.terminal_size,
-        terminal_content.grid.display_offset(),
+        terminal_content.display_offset,
     );
 
     let mut actions = vec![];

@@ -1,5 +1,6 @@
 pub mod settings;
 
+use crate::socket_pty::SocketPty;
 use crate::types::Size;
 use alacritty_terminal::event::{
     Event, EventListener, Notify, OnResize, WindowSize,
@@ -15,13 +16,14 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
-use alacritty_terminal::{tty, Grid};
+use alacritty_terminal::tty;
 use egui::Modifiers;
 use settings::BackendSettings;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
 use std::ops::{Index, RangeInclusive};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
 
@@ -141,6 +143,7 @@ pub struct TerminalBackend {
     size: TerminalSize,
     notifier: Notifier,
     last_content: RenderableContent,
+    dirty: Arc<AtomicBool>,
 }
 
 impl TerminalBackend {
@@ -169,11 +172,13 @@ impl TerminalBackend {
                 "Failed to get child process ID",
             ))?
             .into();
+        let dirty = Arc::new(AtomicBool::new(true));
         let (event_sender, event_receiver) = mpsc::channel();
-        let event_proxy = EventProxy(event_sender);
+        let event_proxy = EventProxy { sender: event_sender, dirty: dirty.clone() };
         let mut term = Term::new(config, &terminal_size, event_proxy.clone());
         let initial_content = RenderableContent {
-            grid: term.grid().clone(),
+            display_offset: term.grid().display_offset(),
+            cursor_point: term.grid().cursor.point,
             selectable_range: None,
             terminal_mode: *term.mode(),
             terminal_size,
@@ -213,7 +218,82 @@ impl TerminalBackend {
             size: terminal_size,
             notifier,
             last_content: initial_content,
+            dirty,
         })
+    }
+
+    /// Create a backend backed by a Unix socket pair instead of a real PTY.
+    ///
+    /// Returns `(TerminalBackend, StreamHandle)` where `StreamHandle` contains
+    /// the other end of the socket and a resize receiver that the caller bridges
+    /// to an external data source (e.g. kube-rs exec/logs).
+    pub fn new_streaming(
+        id: u64,
+        app_context: egui::Context,
+        pty_event_proxy_sender: Sender<(u64, PtyEvent)>,
+    ) -> Result<(Self, StreamHandle)> {
+        let (stream_a, stream_b) = std::os::unix::net::UnixStream::pair()?;
+        let (resize_tx, resize_rx) = std::sync::mpsc::channel();
+        let socket_pty = SocketPty::new(stream_a, resize_tx);
+
+        let dirty = Arc::new(AtomicBool::new(true));
+        let config = term::Config::default();
+        let terminal_size = TerminalSize::default();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let event_proxy = EventProxy { sender: event_sender, dirty: dirty.clone() };
+        let mut term = Term::new(config, &terminal_size, event_proxy.clone());
+        let initial_content = RenderableContent {
+            display_offset: term.grid().display_offset(),
+            cursor_point: term.grid().cursor.point,
+            selectable_range: None,
+            terminal_mode: *term.mode(),
+            terminal_size,
+            cursor: term.grid_mut().cursor_cell().clone(),
+            hovered_hyperlink: None,
+        };
+        let term = Arc::new(FairMutex::new(term));
+        let pty_event_loop =
+            EventLoop::new(term.clone(), event_proxy, socket_pty, false, false)?;
+        let notifier = Notifier(pty_event_loop.channel());
+        let pty_notifier = Notifier(pty_event_loop.channel());
+        let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
+        let _pty_event_loop_thread = pty_event_loop.spawn();
+        let _pty_event_subscription = std::thread::Builder::new()
+            .name(format!("pty_event_subscription_{}", id))
+            .spawn(move || loop {
+                if let Ok(event) = event_receiver.recv() {
+                    pty_event_proxy_sender
+                        .send((id, event.clone()))
+                        .unwrap_or_else(|_| {
+                            panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
+                        });
+                    app_context.clone().request_repaint();
+                    match event {
+                        Event::Exit => break,
+                        Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
+                        _ => {}
+                    }
+                }
+            })?;
+
+        let handle = StreamHandle {
+            stream: stream_b,
+            resize_rx,
+        };
+
+        Ok((
+            Self {
+                id,
+                pty_id: 0,
+                url_regex,
+                term: term.clone(),
+                size: terminal_size,
+                notifier,
+                last_content: initial_content,
+                dirty,
+            },
+            handle,
+        ))
     }
 
     pub fn process_command(&mut self, cmd: BackendCommand) {
@@ -221,25 +301,32 @@ impl TerminalBackend {
         let mut term = term.lock();
         match cmd {
             BackendCommand::Write(input) => {
+                self.dirty.store(true, Ordering::Release);
                 self.write(input);
                 term.scroll_display(Scroll::Bottom);
             },
             BackendCommand::Scroll(delta) => {
+                self.dirty.store(true, Ordering::Release);
                 self.scroll(&mut term, delta);
             },
             BackendCommand::Resize(layout_size, font_size) => {
+                // resize() sets dirty only when grid dimensions change
                 self.resize(&mut term, layout_size, font_size);
             },
             BackendCommand::SelectStart(selection_type, x, y) => {
+                self.dirty.store(true, Ordering::Release);
                 self.start_selection(&mut term, selection_type, x, y);
             },
             BackendCommand::SelectUpdate(x, y) => {
+                self.dirty.store(true, Ordering::Release);
                 self.update_selection(&mut term, x, y);
             },
             BackendCommand::ProcessLink(link_action, point) => {
+                self.dirty.store(true, Ordering::Release);
                 self.process_link_action(&term, link_action, point);
             },
             BackendCommand::MouseReport(button, modifiers, point, pressed) => {
+                self.dirty.store(true, Ordering::Release);
                 self.process_mouse_report(button, modifiers, point, pressed);
             },
         };
@@ -264,7 +351,8 @@ impl TerminalBackend {
         let content = self.last_content();
         let mut result = String::new();
         if let Some(range) = content.selectable_range {
-            for indexed in content.grid.display_iter() {
+            let terminal = self.term.lock();
+            for indexed in terminal.grid().display_iter() {
                 if range.contains(indexed.point) {
                     result.push(indexed.c);
                 }
@@ -273,21 +361,31 @@ impl TerminalBackend {
         result
     }
 
-    pub fn sync(&mut self) -> &RenderableContent {
-        let term = self.term.clone();
-        let mut terminal = term.lock();
-        let selectable_range = match &terminal.selection {
-            Some(s) => s.to_range(&terminal),
+    /// Update metadata from a terminal that is already locked.
+    /// Returns true if there was new content to sync.
+    pub fn sync_with_term(&mut self, terminal: &mut Term<EventProxy>) -> bool {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.last_content.selectable_range = match &terminal.selection {
+            Some(s) => s.to_range(terminal),
             None => None,
         };
-
-        let cursor = terminal.grid_mut().cursor_cell().clone();
-        self.last_content.grid = terminal.grid().clone();
-        self.last_content.selectable_range = selectable_range;
-        self.last_content.cursor = cursor.clone();
+        self.last_content.display_offset = terminal.grid().display_offset();
+        self.last_content.cursor_point = terminal.grid().cursor.point;
+        self.last_content.cursor = terminal.grid_mut().cursor_cell().clone();
         self.last_content.terminal_mode = *terminal.mode();
         self.last_content.terminal_size = self.size;
-        self.last_content()
+        true
+    }
+
+    /// Lock the terminal for direct grid access (used for rendering).
+    pub fn term(&self) -> &Arc<FairMutex<Term<EventProxy>>> {
+        &self.term
+    }
+
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
     }
 
     pub fn last_content(&self) -> &RenderableContent {
@@ -320,18 +418,18 @@ impl TerminalBackend {
                 self.last_content.hovered_hyperlink = None;
             },
             LinkAction::Open => {
-                self.open_link();
+                self.open_link(terminal);
             },
         };
     }
 
-    fn open_link(&self) {
+    fn open_link(&self, terminal: &Term<EventProxy>) {
         if let Some(range) = &self.last_content.hovered_hyperlink {
             let start = range.start();
             let end = range.end();
 
-            let mut url = String::from(self.last_content.grid.index(*start).c);
-            for indexed in self.last_content.grid.iter_from(*start) {
+            let mut url = String::from(terminal.grid().index(*start).c);
+            for indexed in terminal.grid().iter_from(*start) {
                 url.push(indexed.c);
                 if indexed.point == *end {
                     break;
@@ -484,21 +582,31 @@ impl TerminalBackend {
             return;
         }
 
-        let lines = (layout_size.height / font_size.height.floor()) as u16;
-        let cols = (layout_size.width / font_size.width.floor()) as u16;
-        if lines > 0 && cols > 0 {
-            self.size = TerminalSize {
-                layout_size,
-                cell_height: font_size.height as u16,
-                cell_width: font_size.width as u16,
-                num_lines: lines,
-                num_cols: cols,
-            };
+        let new_cell_w = font_size.width as u16;
+        let new_cell_h = font_size.height as u16;
+        let new_lines = (layout_size.height / font_size.height.floor()) as u16;
+        let new_cols = (layout_size.width / font_size.width.floor()) as u16;
 
+        if new_lines == 0 || new_cols == 0 {
+            return;
+        }
+
+        let grid_changed = new_lines != self.size.num_lines || new_cols != self.size.num_cols;
+
+        // Always update pixel dimensions for rendering
+        self.size.layout_size = layout_size;
+        self.size.cell_width = new_cell_w;
+        self.size.cell_height = new_cell_h;
+
+        // Only do expensive grid reflow when character dimensions change
+        if grid_changed {
+            self.size.num_lines = new_lines;
+            self.size.num_cols = new_cols;
+            self.dirty.store(true, Ordering::Release);
             self.notifier.on_resize(self.size.into());
             terminal.resize(TermSize::new(
-                self.size.num_cols as usize,
-                self.size.num_lines as usize,
+                new_cols as usize,
+                new_lines as usize,
             ));
         }
     }
@@ -564,7 +672,8 @@ fn visible_regex_match_iter<'a>(
 }
 
 pub struct RenderableContent {
-    pub grid: Grid<Cell>,
+    pub display_offset: usize,
+    pub cursor_point: Point,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub selectable_range: Option<SelectionRange>,
     pub cursor: Cell,
@@ -575,7 +684,8 @@ pub struct RenderableContent {
 impl Default for RenderableContent {
     fn default() -> Self {
         Self {
-            grid: Grid::new(0, 0, 0),
+            display_offset: 0,
+            cursor_point: Point::default(),
             hovered_hyperlink: None,
             selectable_range: None,
             cursor: Cell::default(),
@@ -585,6 +695,15 @@ impl Default for RenderableContent {
     }
 }
 
+/// Handle returned from `TerminalBackend::new_streaming()`.
+///
+/// The caller uses `stream` to pipe data to/from the terminal, and
+/// `resize_rx` to receive resize events forwarded by alacritty.
+pub struct StreamHandle {
+    pub stream: std::os::unix::net::UnixStream,
+    pub resize_rx: std::sync::mpsc::Receiver<alacritty_terminal::event::WindowSize>,
+}
+
 impl Drop for TerminalBackend {
     fn drop(&mut self) {
         let _ = self.notifier.0.send(Msg::Shutdown);
@@ -592,10 +711,14 @@ impl Drop for TerminalBackend {
 }
 
 #[derive(Clone)]
-pub struct EventProxy(mpsc::Sender<Event>);
+pub struct EventProxy {
+    sender: mpsc::Sender<Event>,
+    dirty: Arc<AtomicBool>,
+}
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
-        let _ = self.0.send(event.clone());
+        self.dirty.store(true, Ordering::Release);
+        let _ = self.sender.send(event.clone());
     }
 }
