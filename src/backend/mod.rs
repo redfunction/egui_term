@@ -555,6 +555,46 @@ impl TerminalBackend {
         self.pty_id
     }
 
+    /// Search the entire scrollback + screen for a regex pattern.
+    /// Returns all matches as `RangeInclusive<Point>`.
+    pub fn search_all(&self, regex: &mut RegexSearch) -> Vec<Match> {
+        let terminal = self.term.lock();
+        let total_lines = terminal.grid().total_lines();
+        let screen_lines = terminal.grid().screen_lines();
+        let history = total_lines.saturating_sub(screen_lines);
+        let start_line = Line(-(history as i32));
+        let end_line = terminal.bottommost_line();
+        let start = terminal.line_search_left(Point::new(start_line, Column(0)));
+        let end = terminal.line_search_right(Point::new(end_line, Column(0)));
+        RegexIter::new(start, end, Direction::Right, &terminal, regex).collect()
+    }
+
+    /// Search only the visible viewport for a regex pattern.
+    pub fn search_visible(&self, regex: &mut RegexSearch) -> Vec<Match> {
+        let terminal = self.term.lock();
+        visible_regex_match_iter(&terminal, regex).collect()
+    }
+
+    /// Scroll the terminal so the given point is visible.
+    pub fn scroll_to_point(&self, point: Point) {
+        let mut terminal = self.term.lock();
+        let screen_lines = terminal.grid().screen_lines();
+        let display_offset = terminal.grid().display_offset();
+        let viewport_start = Line(-(display_offset as i32));
+        let viewport_end = viewport_start + Line(screen_lines as i32 - 1);
+        if point.line < viewport_start {
+            // Need to scroll up (increase display_offset)
+            let delta = viewport_start.0 - point.line.0;
+            terminal.grid_mut().scroll_display(Scroll::Delta(delta));
+            self.dirty.store(true, Ordering::Release);
+        } else if point.line > viewport_end {
+            // Need to scroll down (decrease display_offset)
+            let delta = point.line.0 - viewport_end.0;
+            terminal.grid_mut().scroll_display(Scroll::Delta(-delta));
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
     fn process_link_action(
         &mut self,
         terminal: &Term<EventProxy>,
@@ -809,7 +849,7 @@ impl TerminalBackend {
 
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.
-fn visible_regex_match_iter<'a>(
+pub fn visible_regex_match_iter<'a>(
     term: &'a Term<EventProxy>,
     regex: &'a mut RegexSearch,
 ) -> impl Iterator<Item = Match> + 'a {

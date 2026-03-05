@@ -15,6 +15,7 @@ use egui::{Id, PointerButton};
 use crate::backend::BackendCommand;
 use crate::backend::TerminalBackend;
 use crate::backend::{LinkAction, MouseButton, SelectionType};
+use alacritty_terminal::term::search::RegexSearch;
 use crate::bindings::Binding;
 use crate::bindings::{BindingAction, BindingsLayout, InputKind};
 use crate::font::TerminalFont;
@@ -22,6 +23,13 @@ use crate::theme::TerminalTheme;
 use crate::types::Size;
 
 const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
+
+#[derive(Clone, Copy, PartialEq)]
+enum HighlightKind {
+    None,
+    Match,
+    Current,
+}
 
 #[derive(Debug, Clone)]
 enum InputAction {
@@ -40,6 +48,8 @@ pub struct TerminalViewState {
     scrollbar_grab_offset: f32,
     cached_shapes: Option<Vec<Shape>>,
     cached_rect: Option<Rect>,
+    /// Whether the last render included search highlights (to invalidate cache on change).
+    had_highlights: bool,
 }
 
 pub struct TerminalView<'a> {
@@ -50,6 +60,10 @@ pub struct TerminalView<'a> {
     font: TerminalFont,
     theme: TerminalTheme,
     bindings_layout: BindingsLayout,
+    /// Regex for search highlighting (searched on visible area each frame).
+    search_regex: Option<RegexSearch>,
+    /// The absolute point of the "current" match start (highlighted differently).
+    current_match_start: Option<TerminalGridPoint>,
 }
 
 impl Widget for TerminalView<'_> {
@@ -90,6 +104,8 @@ impl<'a> TerminalView<'a> {
             font: TerminalFont::default(),
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
+            search_regex: None,
+            current_match_start: None,
         }
     }
 
@@ -123,6 +139,20 @@ impl<'a> TerminalView<'a> {
         bindings: Vec<(Binding<InputKind>, BindingAction)>,
     ) -> Self {
         self.bindings_layout.add_bindings(bindings);
+        self
+    }
+
+    /// Set a search regex for highlighting visible matches each frame.
+    #[inline]
+    pub fn set_search(mut self, regex: Option<RegexSearch>) -> Self {
+        self.search_regex = regex;
+        self
+    }
+
+    /// Set the start point of the "current" match (highlighted in a different color).
+    #[inline]
+    pub fn set_current_match(mut self, point: Option<TerminalGridPoint>) -> Self {
+        self.current_match_start = point;
         self
     }
 
@@ -255,15 +285,19 @@ impl<'a> TerminalView<'a> {
     }
 
     fn show(
-        self,
+        mut self,
         state: &mut TerminalViewState,
         layout: &Response,
         painter: &Painter,
     ) {
+        let has_search = self.search_regex.is_some();
+
         // Fast path: if terminal is not dirty, no scrollbar interaction,
-        // and we have a cached frame for the same rect, reuse it.
+        // no search (and none last frame), and we have a cached frame for the same rect, reuse it.
         if !self.backend.is_dirty()
             && !state.scrollbar_dragging
+            && !has_search
+            && !state.had_highlights
             && state.cached_rect == Some(layout.rect)
         {
             if let Some(ref shapes) = state.cached_shapes {
@@ -286,6 +320,21 @@ impl<'a> TerminalView<'a> {
             self.theme.get_color(Color::Named(NamedColor::Background));
         let display_offset = content.display_offset;
         let cursor_point = content.cursor_point;
+
+        // Compute visible search matches once (cheap — only visible viewport).
+        // Store as sorted Vec of match ranges for binary-search lookup.
+        let mut highlight_matches: Vec<std::ops::RangeInclusive<TerminalGridPoint>> = Vec::new();
+        let mut current_match: Option<std::ops::RangeInclusive<TerminalGridPoint>> = None;
+        if let Some(ref mut regex) = self.search_regex {
+            for m in crate::backend::visible_regex_match_iter(&terminal, regex) {
+                if self.current_match_start.as_ref() == Some(m.start()) {
+                    current_match = Some(m);
+                } else {
+                    highlight_matches.push(m);
+                }
+            }
+        }
+        let has_any_highlights = current_match.is_some() || !highlight_matches.is_empty();
 
         let mut shapes = vec![Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
@@ -316,6 +365,19 @@ impl<'a> TerminalView<'a> {
                         && r.contains(&state.current_mouse_position_on_grid)
                 });
 
+            // Check search highlights
+            let highlight_kind = if has_any_highlights {
+                if current_match.as_ref().is_some_and(|r| r.contains(&indexed.point)) {
+                    HighlightKind::Current
+                } else if highlight_matches.iter().any(|r| r.contains(&indexed.point)) {
+                    HighlightKind::Match
+                } else {
+                    HighlightKind::None
+                }
+            } else {
+                HighlightKind::None
+            };
+
             let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
             let line_num =
                 indexed.point.line.0 + display_offset as i32;
@@ -335,6 +397,18 @@ impl<'a> TerminalView<'a> {
 
             if is_inverse || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
+            }
+
+            match highlight_kind {
+                HighlightKind::Current => {
+                    bg = egui::Color32::from_rgb(255, 150, 50); // orange for current match
+                    fg = egui::Color32::BLACK;
+                }
+                HighlightKind::Match => {
+                    bg = egui::Color32::from_rgb(180, 160, 60); // yellow for other matches
+                    fg = egui::Color32::BLACK;
+                }
+                HighlightKind::None => {}
             }
 
             if global_bg != bg {
@@ -391,6 +465,45 @@ impl<'a> TerminalView<'a> {
                         fg,
                     )
                 }));
+            }
+        }
+
+        // Draw border around current search match
+        if let Some(ref cm) = current_match {
+            let cols = terminal.grid().columns();
+            let start = *cm.start();
+            let end = *cm.end();
+            let border_color = egui::Color32::from_rgb(255, 180, 50);
+            let stroke = Stroke::new(2.0, border_color);
+
+            if start.line == end.line {
+                // Single-line match: one border rect
+                let x1 = layout_min.x + (cell_width * start.column.0 as f32);
+                let x2 = layout_min.x + (cell_width * (end.column.0 as f32 + 1.0));
+                let line_num = start.line.0 + display_offset as i32;
+                let y = layout_min.y + (cell_height * line_num as f32);
+                let rect = Rect::from_min_size(
+                    Pos2::new(x1, y),
+                    Vec2::new(x2 - x1, cell_height),
+                );
+                shapes.push(Shape::Rect(RectShape::new(rect, CornerRadius::same(2), egui::Color32::TRANSPARENT, stroke, egui::StrokeKind::Outside)));
+            } else {
+                // Multi-line match: border per line
+                let mut line = start.line;
+                while line <= end.line {
+                    let line_num = line.0 + display_offset as i32;
+                    let y = layout_min.y + (cell_height * line_num as f32);
+                    let col_start = if line == start.line { start.column.0 } else { 0 };
+                    let col_end = if line == end.line { end.column.0 + 1 } else { cols };
+                    let x1 = layout_min.x + (cell_width * col_start as f32);
+                    let x2 = layout_min.x + (cell_width * col_end as f32);
+                    let rect = Rect::from_min_size(
+                        Pos2::new(x1, y),
+                        Vec2::new(x2 - x1, cell_height),
+                    );
+                    shapes.push(Shape::Rect(RectShape::new(rect, CornerRadius::same(2), egui::Color32::TRANSPARENT, stroke, egui::StrokeKind::Outside)));
+                    line += 1;
+                }
             }
         }
 
@@ -492,6 +605,7 @@ impl<'a> TerminalView<'a> {
         // Cache shapes for reuse when terminal is idle
         state.cached_shapes = Some(shapes.clone());
         state.cached_rect = Some(layout.rect);
+        state.had_highlights = has_any_highlights;
         painter.extend(shapes);
     }
 }

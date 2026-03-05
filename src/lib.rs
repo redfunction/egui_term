@@ -12,3 +12,9 @@ pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
 pub use theme::{ColorPalette, TerminalTheme};
 pub use view::TerminalView;
+
+// Re-export alacritty types needed for search
+pub use alacritty_terminal::term::search::RegexSearch;
+pub use alacritty_terminal::index::Point as TermPoint;
+/// A search match is a range of terminal grid points.
+pub type SearchMatch = std::ops::RangeInclusive<TermPoint>;
