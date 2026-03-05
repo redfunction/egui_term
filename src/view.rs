@@ -38,6 +38,8 @@ pub struct TerminalViewState {
     scrollbar_dragging: bool,
     /// Y offset from click point to thumb top, so thumb doesn't snap on grab
     scrollbar_grab_offset: f32,
+    cached_shapes: Option<Vec<Shape>>,
+    cached_rect: Option<Rect>,
 }
 
 pub struct TerminalView<'a> {
@@ -253,11 +255,23 @@ impl<'a> TerminalView<'a> {
     }
 
     fn show(
-        self,
+        mut self,
         state: &mut TerminalViewState,
         layout: &Response,
         painter: &Painter,
     ) {
+        // Fast path: if terminal is not dirty, no scrollbar interaction,
+        // and we have a cached frame for the same rect, reuse it.
+        if !self.backend.is_dirty()
+            && !state.scrollbar_dragging
+            && state.cached_rect == Some(layout.rect)
+        {
+            if let Some(ref shapes) = state.cached_shapes {
+                painter.extend(shapes.clone());
+                return;
+            }
+        }
+
         // Single lock for both metadata sync and rendering
         let term_arc = self.backend.term().clone();
         let mut terminal = term_arc.lock();
@@ -410,11 +424,15 @@ impl<'a> TerminalView<'a> {
                 Vec2::new(scrollbar_width, thumb_height),
             );
 
-            // Interaction
-            let pointer_pos = layout.ctx.input(|i| i.pointer.hover_pos());
-            let primary_down = layout.ctx.input(|i| i.pointer.primary_down());
-            let primary_pressed =
-                layout.ctx.input(|i| i.pointer.primary_pressed());
+            // Batch pointer state into a single input lock
+            let (pointer_pos, primary_down, primary_pressed) =
+                layout.ctx.input(|i| {
+                    (
+                        i.pointer.hover_pos(),
+                        i.pointer.primary_down(),
+                        i.pointer.primary_pressed(),
+                    )
+                });
 
             if let Some(pos) = pointer_pos {
                 if primary_pressed && track_rect.contains(pos) {
@@ -470,6 +488,10 @@ impl<'a> TerminalView<'a> {
         }
 
         drop(terminal);
+
+        // Cache shapes for reuse when terminal is idle
+        state.cached_shapes = Some(shapes.clone());
+        state.cached_rect = Some(layout.rect);
         painter.extend(shapes);
     }
 }

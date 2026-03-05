@@ -73,6 +73,7 @@ impl Default for ColorPalette {
 pub struct TerminalTheme {
     palette: Box<ColorPalette>,
     ansi256_colors: HashMap<u8, Color32>,
+    color_cache: HashMap<String, Color32>,
 }
 
 impl Default for TerminalTheme {
@@ -80,6 +81,7 @@ impl Default for TerminalTheme {
         Self {
             palette: Box::<ColorPalette>::default(),
             ansi256_colors: TerminalTheme::get_ansi256_colors(),
+            color_cache: HashMap::new(),
         }
     }
 }
@@ -89,6 +91,7 @@ impl TerminalTheme {
         Self {
             palette,
             ansi256_colors: TerminalTheme::get_ansi256_colors(),
+            color_cache: HashMap::new(),
         }
     }
 
@@ -120,7 +123,16 @@ impl TerminalTheme {
         ansi256_colors
     }
 
-    pub fn get_color(&self, c: ansi::Color) -> Color32 {
+    fn get_cached_hex_color(&mut self, hex: &str) -> Color32 {
+        if let Some(&color) = self.color_cache.get(hex) {
+            return color;
+        }
+        let color = hex_to_color(hex).unwrap_or(Color32::BLACK);
+        self.color_cache.insert(hex.to_string(), color);
+        color
+    }
+
+    pub fn get_color(&mut self, c: ansi::Color) -> Color32 {
         match c {
             ansi::Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
             ansi::Color::Indexed(index) => {
@@ -147,8 +159,9 @@ impl TerminalTheme {
                         _ => &self.palette.background,
                     };
 
-                    return hex_to_color(color)
-                        .unwrap_or_else(|_| panic!("invalid color {}", color));
+                    // Clone to avoid borrow conflict with &mut self
+                    let color = color.clone();
+                    return self.get_cached_hex_color(&color);
                 }
 
                 // Other colors
@@ -198,8 +211,9 @@ impl TerminalTheme {
                     _ => &self.palette.background,
                 };
 
-                hex_to_color(color)
-                    .unwrap_or_else(|_| panic!("invalid color {}", color))
+                // Clone to avoid borrow conflict with &mut self
+                let color = color.clone();
+                self.get_cached_hex_color(&color)
             },
         }
     }

@@ -505,6 +505,10 @@ impl TerminalBackend {
         &self.term
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
