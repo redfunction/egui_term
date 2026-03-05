@@ -24,9 +24,39 @@ use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
 use std::ops::{Index, RangeInclusive};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
+
+/// Minimum interval between repaint requests (milliseconds).
+/// This controls how often the *parent* window is asked to repaint.
+/// When terminals live in deferred viewports, the parent repaint is
+/// only needed for re-registering callbacks, not for actual rendering.
+/// Higher value = less CPU. Terminal viewports self-refresh independently.
+const REPAINT_THROTTLE_MS: u64 = 1000;
+
+/// Global repaint throttle shared by every terminal backend.
+static GLOBAL_LAST_REPAINT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic millisecond timestamp for repaint throttling.
+fn now_ms() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_millis() as u64
+}
+
+/// Request a repaint only if enough time has passed since the last global request.
+/// All terminals share one throttle so N terminals don't cause N× repaints.
+fn throttled_repaint(ctx: &egui::Context) {
+    let now = now_ms();
+    let prev = GLOBAL_LAST_REPAINT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) >= REPAINT_THROTTLE_MS {
+        GLOBAL_LAST_REPAINT_MS.store(now, Ordering::Relaxed);
+        ctx.request_repaint_after(std::time::Duration::from_millis(REPAINT_THROTTLE_MS));
+    }
+}
 
 pub type TerminalMode = TermMode;
 pub type PtyEvent = Event;
@@ -236,7 +266,7 @@ impl TerminalBackend {
                 match event_receiver.recv() {
                     Ok(event) => {
                         let _ = pty_event_proxy_sender.send((id, event.clone()));
-                        app_context.clone().request_repaint_after(std::time::Duration::from_millis(16));
+                        throttled_repaint(&app_context);
                         match event {
                             Event::Exit => break,
                             Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
@@ -301,7 +331,7 @@ impl TerminalBackend {
                 match event_receiver.recv() {
                     Ok(event) => {
                         let _ = pty_event_proxy_sender.send((id, event.clone()));
-                        app_context.clone().request_repaint_after(std::time::Duration::from_millis(16));
+                        throttled_repaint(&app_context);
                         match event {
                             Event::Exit => break,
                             Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
@@ -383,7 +413,7 @@ impl TerminalBackend {
                 match event_receiver.recv() {
                     Ok(event) => {
                         let _ = pty_event_proxy_sender.send((id, event.clone()));
-                        app_context.clone().request_repaint_after(std::time::Duration::from_millis(16));
+                        throttled_repaint(&app_context);
                         match event {
                             Event::Exit => break,
                             Event::PtyWrite(data) => {
@@ -851,7 +881,7 @@ impl DirectWriter {
         self.inner.dirty.store(true, Ordering::Release);
         drop(processor);
         drop(term);
-        self.inner.app_context.request_repaint_after(std::time::Duration::from_millis(16));
+        throttled_repaint(&self.inner.app_context);
     }
 }
 

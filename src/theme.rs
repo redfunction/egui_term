@@ -1,6 +1,7 @@
 use alacritty_terminal::vte::ansi::{self, NamedColor};
 use egui::Color32;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ColorPalette {
@@ -71,28 +72,60 @@ impl Default for ColorPalette {
 
 #[derive(Debug, Clone)]
 pub struct TerminalTheme {
-    palette: Box<ColorPalette>,
-    ansi256_colors: HashMap<u8, Color32>,
-    color_cache: HashMap<String, Color32>,
+    palette: Arc<ColorPalette>,
+    ansi256_colors: Arc<HashMap<u8, Color32>>,
+    /// Pre-populated hex→Color32 cache. All palette colors are resolved at
+    /// construction so cloning is cheap and get_color() never allocates.
+    color_cache: Arc<HashMap<String, Color32>>,
 }
 
 impl Default for TerminalTheme {
     fn default() -> Self {
+        let palette = ColorPalette::default();
+        let color_cache = Arc::new(Self::build_color_cache(&palette));
         Self {
-            palette: Box::<ColorPalette>::default(),
-            ansi256_colors: TerminalTheme::get_ansi256_colors(),
-            color_cache: HashMap::new(),
+            palette: Arc::new(palette),
+            ansi256_colors: Arc::new(TerminalTheme::get_ansi256_colors()),
+            color_cache,
         }
     }
 }
 
 impl TerminalTheme {
     pub fn new(palette: Box<ColorPalette>) -> Self {
+        let color_cache = Arc::new(Self::build_color_cache(&palette));
         Self {
-            palette,
-            ansi256_colors: TerminalTheme::get_ansi256_colors(),
-            color_cache: HashMap::new(),
+            palette: Arc::from(*palette),
+            ansi256_colors: Arc::new(TerminalTheme::get_ansi256_colors()),
+            color_cache,
         }
+    }
+
+    /// Pre-resolve every palette hex string so get_color() never parses at runtime.
+    fn build_color_cache(palette: &ColorPalette) -> HashMap<String, Color32> {
+        let mut cache = HashMap::new();
+        let all_hex = [
+            &palette.foreground, &palette.background,
+            &palette.black, &palette.red, &palette.green, &palette.yellow,
+            &palette.blue, &palette.magenta, &palette.cyan, &palette.white,
+            &palette.bright_black, &palette.bright_red, &palette.bright_green,
+            &palette.bright_yellow, &palette.bright_blue, &palette.bright_magenta,
+            &palette.bright_cyan, &palette.bright_white,
+            &palette.dim_foreground, &palette.dim_black, &palette.dim_red,
+            &palette.dim_green, &palette.dim_yellow, &palette.dim_blue,
+            &palette.dim_magenta, &palette.dim_cyan, &palette.dim_white,
+        ];
+        for hex in all_hex {
+            if let Ok(color) = hex_to_color(hex) {
+                cache.insert(hex.clone(), color);
+            }
+        }
+        if let Some(bf) = &palette.bright_foreground {
+            if let Ok(color) = hex_to_color(bf) {
+                cache.insert(bf.clone(), color);
+            }
+        }
+        cache
     }
 
     fn get_ansi256_colors() -> HashMap<u8, Color32> {
@@ -123,16 +156,12 @@ impl TerminalTheme {
         ansi256_colors
     }
 
-    fn get_cached_hex_color(&mut self, hex: &str) -> Color32 {
-        if let Some(&color) = self.color_cache.get(hex) {
-            return color;
-        }
-        let color = hex_to_color(hex).unwrap_or(Color32::BLACK);
-        self.color_cache.insert(hex.to_string(), color);
-        color
+    fn get_cached_hex_color(&self, hex: &str) -> Color32 {
+        // All palette colors are pre-populated at construction time
+        self.color_cache.get(hex).copied().unwrap_or(Color32::BLACK)
     }
 
-    pub fn get_color(&mut self, c: ansi::Color) -> Color32 {
+    pub fn get_color(&self, c: ansi::Color) -> Color32 {
         match c {
             ansi::Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
             ansi::Color::Indexed(index) => {
@@ -159,9 +188,7 @@ impl TerminalTheme {
                         _ => &self.palette.background,
                     };
 
-                    // Clone to avoid borrow conflict with &mut self
-                    let color = color.clone();
-                    return self.get_cached_hex_color(&color);
+                    return self.get_cached_hex_color(color);
                 }
 
                 // Other colors
@@ -210,10 +237,7 @@ impl TerminalTheme {
                     NamedColor::DimWhite => &self.palette.dim_white,
                     _ => &self.palette.background,
                 };
-
-                // Clone to avoid borrow conflict with &mut self
-                let color = color.clone();
-                self.get_cached_hex_color(&color)
+                self.get_cached_hex_color(color)
             },
         }
     }

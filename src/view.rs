@@ -255,7 +255,7 @@ impl<'a> TerminalView<'a> {
     }
 
     fn show(
-        mut self,
+        self,
         state: &mut TerminalViewState,
         layout: &Response,
         painter: &Painter,
