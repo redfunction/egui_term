@@ -233,18 +233,17 @@ impl TerminalBackend {
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
-                if let Ok(event) = event_receiver.recv() {
-                    pty_event_proxy_sender
-                        .send((id, event.clone()))
-                        .unwrap_or_else(|_| {
-                            panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
-                        });
-                    app_context.clone().request_repaint();
-                    match event {
-                        Event::Exit => break,
-                        Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
-                        _ => {}
+                match event_receiver.recv() {
+                    Ok(event) => {
+                        let _ = pty_event_proxy_sender.send((id, event.clone()));
+                        app_context.clone().request_repaint_after(std::time::Duration::from_millis(16));
+                        match event {
+                            Event::Exit => break,
+                            Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
+                            _ => {}
+                        }
                     }
+                    Err(_) => break,
                 }
             })?;
 
@@ -299,18 +298,17 @@ impl TerminalBackend {
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
-                if let Ok(event) = event_receiver.recv() {
-                    pty_event_proxy_sender
-                        .send((id, event.clone()))
-                        .unwrap_or_else(|_| {
-                            panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
-                        });
-                    app_context.clone().request_repaint();
-                    match event {
-                        Event::Exit => break,
-                        Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
-                        _ => {}
+                match event_receiver.recv() {
+                    Ok(event) => {
+                        let _ = pty_event_proxy_sender.send((id, event.clone()));
+                        app_context.clone().request_repaint_after(std::time::Duration::from_millis(16));
+                        match event {
+                            Event::Exit => break,
+                            Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
+                            _ => {}
+                        }
                     }
+                    Err(_) => break,
                 }
             })?;
 
@@ -329,7 +327,7 @@ impl TerminalBackend {
                 sink: Sink::EventLoop { notifier },
                 last_content: initial_content,
                 dirty,
-            },
+                },
             handle,
         ))
     }
@@ -382,20 +380,19 @@ impl TerminalBackend {
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
-                if let Ok(event) = event_receiver.recv() {
-                    pty_event_proxy_sender
-                        .send((id, event.clone()))
-                        .unwrap_or_else(|_| {
-                            panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
-                        });
-                    app_context.clone().request_repaint();
-                    match event {
-                        Event::Exit => break,
-                        Event::PtyWrite(data) => {
-                            let _ = input_tx_for_events.send(data.into_bytes());
+                match event_receiver.recv() {
+                    Ok(event) => {
+                        let _ = pty_event_proxy_sender.send((id, event.clone()));
+                        app_context.clone().request_repaint_after(std::time::Duration::from_millis(16));
+                        match event {
+                            Event::Exit => break,
+                            Event::PtyWrite(data) => {
+                                let _ = input_tx_for_events.send(data.into_bytes());
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    Err(_) => break, // Channel disconnected, stop thread
                 }
             })?;
 
@@ -850,7 +847,7 @@ impl DirectWriter {
         self.inner.dirty.store(true, Ordering::Release);
         drop(processor);
         drop(term);
-        self.inner.app_context.request_repaint();
+        self.inner.app_context.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
