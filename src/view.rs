@@ -292,10 +292,23 @@ impl<'a> TerminalView<'a> {
     ) {
         let has_search = self.search_regex.is_some();
 
+        // Check if pointer is interacting with the scrollbar area
+        let scrollbar_x = layout.rect.max.x - 8.0;
+        let pointer_on_scrollbar = layout.ctx.input(|i| {
+            if let Some(pos) = i.pointer.hover_pos() {
+                (i.pointer.primary_pressed() || i.pointer.primary_down())
+                    && pos.x >= scrollbar_x
+                    && layout.rect.contains(pos)
+            } else {
+                false
+            }
+        });
+
         // Fast path: if terminal is not dirty, no scrollbar interaction,
         // no search (and none last frame), and we have a cached frame for the same rect, reuse it.
         if !self.backend.is_dirty()
             && !state.scrollbar_dragging
+            && !pointer_on_scrollbar
             && !has_search
             && !state.had_highlights
             && state.cached_rect == Some(layout.rect)
@@ -549,13 +562,19 @@ impl<'a> TerminalView<'a> {
 
             if let Some(pos) = pointer_pos {
                 if primary_pressed && track_rect.contains(pos) {
-                    state.scrollbar_dragging = true;
                     if thumb_rect.contains(pos) {
                         // Grabbing the thumb: remember offset so it doesn't snap
+                        state.scrollbar_dragging = true;
                         state.scrollbar_grab_offset = pos.y - thumb_top;
                     } else {
-                        // Clicked on track: center thumb at click
-                        state.scrollbar_grab_offset = thumb_height / 2.0;
+                        // Clicked on track above/below thumb: scroll by one page
+                        let page = screen_lines.saturating_sub(1).max(1) as i32;
+                        if pos.y < thumb_rect.min.y {
+                            terminal.scroll_display(Scroll::Delta(page));
+                        } else {
+                            terminal.scroll_display(Scroll::Delta(-page));
+                        }
+                        self.backend.mark_dirty();
                     }
                 }
 
