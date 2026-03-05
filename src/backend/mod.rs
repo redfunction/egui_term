@@ -212,6 +212,8 @@ pub struct TerminalBackend {
     sink: Sink,
     last_content: RenderableContent,
     dirty: Arc<AtomicBool>,
+    /// Shared flag for sticky-scroll (log mode): keep view stable as new content arrives.
+    sticky_scroll: Option<Arc<AtomicBool>>,
 }
 
 impl TerminalBackend {
@@ -286,6 +288,7 @@ impl TerminalBackend {
             sink: Sink::EventLoop { notifier },
             last_content: initial_content,
             dirty,
+            sticky_scroll: None,
         })
     }
 
@@ -357,6 +360,7 @@ impl TerminalBackend {
                 sink: Sink::EventLoop { notifier },
                 last_content: initial_content,
                 dirty,
+                sticky_scroll: None,
                 },
             handle,
         ))
@@ -396,12 +400,14 @@ impl TerminalBackend {
 
         let processor = Processor::new();
 
+        let sticky_scroll = Arc::new(AtomicBool::new(false));
         let writer = DirectWriter {
             inner: Arc::new(DirectWriterInner {
                 term: term.clone(),
                 processor: Mutex::new(processor),
                 app_context: app_context.clone(),
                 dirty: dirty.clone(),
+                sticky_scroll: sticky_scroll.clone(),
             }),
         };
 
@@ -442,6 +448,7 @@ impl TerminalBackend {
                 sink: Sink::Channel { input_tx, resize_tx },
                 last_content: initial_content,
                 dirty,
+                sticky_scroll: Some(sticky_scroll),
             },
             handle,
         ))
@@ -498,15 +505,78 @@ impl TerminalBackend {
         viewport_to_point(display_offset, Point::new(line, col))
     }
 
+    /// Extract all text from the terminal buffer (history + visible screen).
+    pub fn full_text(&self) -> String {
+        let terminal = self.term.lock();
+        let total_lines = terminal.grid().total_lines();
+        let screen_lines = terminal.grid().screen_lines();
+        let history = total_lines.saturating_sub(screen_lines);
+        let columns = terminal.grid().columns();
+
+        let mut result = String::new();
+        let start_line = -(history as i32);
+        let end_line = screen_lines as i32 - 1;
+
+        for line_idx in start_line..=end_line {
+            let line = Line(line_idx);
+            let mut row_text = String::new();
+            for col in 0..columns {
+                let point = Point::new(line, Column(col));
+                let cell = &terminal.grid()[point];
+                row_text.push(cell.c);
+            }
+            // Check if this row wraps to the next (no newline between them)
+            let last_cell = &terminal.grid()[Point::new(line, Column(columns - 1))];
+            let is_wrapped = last_cell.flags.contains(term::cell::Flags::WRAPLINE);
+
+            let trimmed = row_text.trim_end();
+            result.push_str(trimmed);
+            if !is_wrapped {
+                result.push('\n');
+            }
+        }
+        // Remove trailing empty lines
+        while result.ends_with("\n\n") {
+            result.pop();
+        }
+        result
+    }
+
     pub fn selectable_content(&self) -> String {
         let content = self.last_content();
         let mut result = String::new();
         if let Some(range) = content.selectable_range {
             let terminal = self.term.lock();
-            for indexed in terminal.grid().display_iter() {
-                if range.contains(indexed.point) {
-                    result.push(indexed.c);
+            let columns = terminal.grid().columns();
+            let start = range.start;
+            let end = range.end;
+
+            // Iterate line by line from start.line to end.line
+            let mut line = start.line;
+            while line <= end.line {
+                let col_start = if line == start.line { start.column.0 } else { 0 };
+                let col_end = if line == end.line { end.column.0 + 1 } else { columns };
+
+                let mut row_text = String::new();
+                for col in col_start..col_end {
+                    let point = Point::new(line, Column(col));
+                    let cell = &terminal.grid()[point];
+                    row_text.push(cell.c);
                 }
+
+                let trimmed = row_text.trim_end();
+                result.push_str(trimmed);
+
+                // Add newline unless this row wraps to the next, or it's the last line
+                if line < end.line {
+                    let last_cell = &terminal.grid()[Point::new(line, Column(columns - 1))];
+                    let is_wrapped = last_cell.flags.contains(term::cell::Flags::WRAPLINE);
+                    if !is_wrapped {
+                        result.push('\n');
+                    }
+                }
+
+                line += 1i32;
             }
         }
         result
@@ -541,6 +611,20 @@ impl TerminalBackend {
 
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Enable sticky-scroll mode (log mode): when the user scrolls up,
+    /// new content won't auto-scroll the view down.
+    pub fn set_sticky_scroll(&self, enabled: bool) {
+        if let Some(ref ss) = self.sticky_scroll {
+            ss.store(enabled, Ordering::Relaxed);
+        }
+    }
+
+    /// Check if the terminal is scrolled to the bottom.
+    pub fn is_at_bottom(&self) -> bool {
+        let terminal = self.term.lock();
+        terminal.grid().display_offset() == 0
     }
 
     pub fn last_content(&self) -> &RenderableContent {
@@ -910,16 +994,35 @@ struct DirectWriterInner {
     processor: Mutex<Processor>,
     app_context: egui::Context,
     dirty: Arc<AtomicBool>,
+    /// When true, keep view position stable as new content arrives (log mode).
+    sticky_scroll: Arc<AtomicBool>,
 }
 
 impl DirectWriter {
     /// Feed raw bytes into the terminal emulator.
     pub fn write(&self, data: &[u8]) {
         let mut term = self.inner.term.lock();
+        let old_offset = term.grid().display_offset();
+        let old_history = term.grid().total_lines().saturating_sub(term.grid().screen_lines());
         let mut processor = self.inner.processor.lock().unwrap();
         processor.advance(&mut *term, data);
-        self.inner.dirty.store(true, Ordering::Release);
         drop(processor);
+
+        // In sticky_scroll mode: if the user was scrolled up, adjust
+        // display_offset to keep the same content visible.
+        if self.inner.sticky_scroll.load(Ordering::Relaxed) && old_offset > 0 {
+            let new_history = term.grid().total_lines().saturating_sub(term.grid().screen_lines());
+            let added = new_history.saturating_sub(old_history);
+            if added > 0 {
+                let new_offset = (old_offset + added).min(new_history);
+                term.scroll_display(Scroll::Bottom);
+                if new_offset > 0 {
+                    term.scroll_display(Scroll::Delta(new_offset as i32));
+                }
+            }
+        }
+
+        self.inner.dirty.store(true, Ordering::Release);
         drop(term);
         throttled_repaint(&self.inner.app_context);
     }

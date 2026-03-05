@@ -64,6 +64,8 @@ pub struct TerminalView<'a> {
     search_regex: Option<RegexSearch>,
     /// The absolute point of the "current" match start (highlighted differently).
     current_match_start: Option<TerminalGridPoint>,
+    /// When true, keyboard input is not sent to the terminal (log/read-only mode).
+    read_only: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -106,6 +108,7 @@ impl<'a> TerminalView<'a> {
             bindings_layout: BindingsLayout::new(),
             search_regex: None,
             current_match_start: None,
+            read_only: false,
         }
     }
 
@@ -156,6 +159,12 @@ impl<'a> TerminalView<'a> {
         self
     }
 
+    #[inline]
+    pub fn set_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     fn focus(self, layout: &Response) -> Self {
         if self.has_focus {
             layout.request_focus();
@@ -196,12 +205,12 @@ impl<'a> TerminalView<'a> {
             let mut input_actions = vec![];
 
             match event {
-                // Keyboard events: require focus only
+                // Keyboard events: require focus only; skip in read-only mode
                 egui::Event::Text(_)
                 | egui::Event::Key { .. }
                 | egui::Event::Copy
                 | egui::Event::Paste(_) => {
-                    if !has_focus {
+                    if !has_focus || self.read_only {
                         continue;
                     }
                     input_actions.push(process_keyboard_event(
@@ -223,7 +232,7 @@ impl<'a> TerminalView<'a> {
                         delta,
                     ))
                 },
-                // Mouse button: require pointer over widget
+                // Mouse button: require pointer over widget (or dragging for release)
                 egui::Event::PointerButton {
                     button,
                     pressed,
@@ -231,7 +240,7 @@ impl<'a> TerminalView<'a> {
                     pos,
                     ..
                 } => {
-                    if !has_pointer {
+                    if !has_pointer && !(state.is_dragged && !pressed) {
                         continue;
                     }
                     // Skip if clicking in scrollbar area or dragging scrollbar
@@ -251,7 +260,7 @@ impl<'a> TerminalView<'a> {
                 },
                 // Mouse move: require pointer over widget
                 egui::Event::PointerMoved(pos) => {
-                    if !has_pointer {
+                    if !has_pointer && !state.is_dragged {
                         continue;
                     }
                     if state.scrollbar_dragging || pos.x >= scrollbar_x {
@@ -911,6 +920,16 @@ fn process_mouse_move(
                 true,
             ))
         } else {
+            // Auto-scroll when dragging above or below the terminal area
+            let cell_height = terminal_content.terminal_size.cell_height as f32;
+            if cursor_y < 0.0 {
+                let lines = ((-cursor_y) / cell_height).ceil().max(1.0) as i32;
+                actions.push(InputAction::BackendCall(BackendCommand::Scroll(lines)));
+            } else if cursor_y > layout.rect.height() {
+                let overflow = cursor_y - layout.rect.height();
+                let lines = (overflow / cell_height).ceil().max(1.0) as i32;
+                actions.push(InputAction::BackendCall(BackendCommand::Scroll(-lines)));
+            }
             InputAction::BackendCall(BackendCommand::SelectUpdate(
                 cursor_x, cursor_y,
             ))
