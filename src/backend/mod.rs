@@ -621,6 +621,13 @@ impl TerminalBackend {
         }
     }
 
+    /// Scroll the terminal to the very top of the scrollback history.
+    pub fn scroll_to_top(&self) {
+        let mut terminal = self.term.lock();
+        terminal.grid_mut().scroll_display(Scroll::Top);
+        self.dirty.store(true, Ordering::Release);
+    }
+
     /// Check if the terminal is scrolled to the bottom.
     pub fn is_at_bottom(&self) -> bool {
         let terminal = self.term.lock();
