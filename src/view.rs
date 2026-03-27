@@ -66,6 +66,8 @@ pub struct TerminalView<'a> {
     current_match_start: Option<TerminalGridPoint>,
     /// When true, keyboard input is not sent to the terminal (log/read-only mode).
     read_only: bool,
+    /// When true, the cursor block is not drawn.
+    hide_cursor: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -109,6 +111,7 @@ impl<'a> TerminalView<'a> {
             search_regex: None,
             current_match_start: None,
             read_only: false,
+            hide_cursor: false,
         }
     }
 
@@ -162,6 +165,12 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    #[inline]
+    pub fn set_hide_cursor(mut self, hide: bool) -> Self {
+        self.hide_cursor = hide;
         self
     }
 
@@ -455,7 +464,7 @@ impl<'a> TerminalView<'a> {
                 });
             }
 
-            if cursor_point == indexed.point {
+            if cursor_point == indexed.point && !self.hide_cursor {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(
@@ -470,6 +479,7 @@ impl<'a> TerminalView<'a> {
             if indexed.c != ' ' && indexed.c != '\t' {
                 if cursor_point == indexed.point
                     && is_app_cursor_mode
+                    && !self.hide_cursor
                 {
                     std::mem::swap(&mut fg, &mut bg);
                 }
