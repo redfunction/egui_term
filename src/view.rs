@@ -622,17 +622,30 @@ impl<'a> TerminalView<'a> {
                 state.scrollbar_dragging = false;
             }
 
+            // Scrollbar tint: derive from the palette's foreground so
+            // the bar stays visible on any terminal background. Pure-
+            // white alpha (the previous constant) reads fine on a
+            // black terminal but disappears on light-theme palettes
+            // where the terminal bg is near-white or light gray.
+            let sb_fg = self.theme
+                .get_color(Color::Named(NamedColor::Foreground));
+            let track_color = egui::Color32::from_rgba_unmultiplied(
+                sb_fg.r(), sb_fg.g(), sb_fg.b(), 24,
+            );
+            let thumb_color = egui::Color32::from_rgba_unmultiplied(
+                sb_fg.r(), sb_fg.g(), sb_fg.b(), 110,
+            );
             // Draw scrollbar track
             shapes.push(Shape::Rect(RectShape::filled(
                 track_rect,
                 CornerRadius::same(4),
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+                track_color,
             )));
             // Draw scrollbar thumb
             shapes.push(Shape::Rect(RectShape::filled(
                 thumb_rect,
                 CornerRadius::same(4),
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+                thumb_color,
             )));
         } else {
             state.scrollbar_dragging = false;
