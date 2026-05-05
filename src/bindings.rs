@@ -238,7 +238,11 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         Backslash,    Modifiers::CTRL; BindingAction::Char('\x1c');
         Minus,        Modifiers::CTRL; BindingAction::Char('\x1f');
         // SHIFT
-        Enter,      Modifiers::SHIFT; BindingAction::Char('\x0d');
+        // Shift+Enter → LF (0x0a) instead of CR (0x0d) so TUI apps
+        // (Claude Code, Cursor, iTerm-aware editors) can distinguish
+        // it from plain Enter and treat it as a soft newline. Shells
+        // (bash, zsh) treat LF and CR identically, so no regression.
+        Enter,      Modifiers::SHIFT; BindingAction::Char('\x0a');
         Backspace,  Modifiers::SHIFT; BindingAction::Char('\x7f');
         Tab,        Modifiers::SHIFT; BindingAction::Esc("\x1b[Z".into());
         End,        Modifiers::SHIFT, +TerminalMode::ALT_SCREEN; BindingAction::Esc("\x1b[1;2F".into());
