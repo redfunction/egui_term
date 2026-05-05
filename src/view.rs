@@ -205,6 +205,29 @@ impl<'a> TerminalView<'a> {
             return self;
         }
 
+        // Stop egui's focus system from stealing Tab / arrow keys /
+        // Escape away from the terminal when it has focus. Without
+        // this, pressing Tab moves focus to the next widget (e.g. a
+        // toolbar button highlighting briefly) instead of being
+        // delivered to the PTY, and arrow keys do the same via
+        // egui's directional focus navigation. The widget still
+        // receives these as ordinary Key events. Note: we lock on
+        // `layout.id` (the Response id used by request_focus) — using
+        // the persistent widget id here is silently ignored.
+        if has_focus {
+            layout.ctx.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    layout.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+        }
+
         // Scrollbar occupies the rightmost 8px of the layout
         let scrollbar_x = layout.rect.max.x - 8.0;
 
@@ -675,6 +698,9 @@ fn process_keyboard_event(
             #[cfg(not(any(target_os = "ios", target_os = "macos")))]
             if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
                 BackendCommand::Write(text.as_bytes().to_vec())
+            } else if modifiers.alt {
+                // Ctrl+Alt+V → ESC + ^V (Meta-on-control).
+                BackendCommand::Write(vec![0x1b, 0x16])
             } else {
                 // Hotfix - Send ^V when there's not selection on view.
                 BackendCommand::Write([0x16].to_vec())
@@ -689,6 +715,9 @@ fn process_keyboard_event(
             if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
                 let content = backend.selectable_content();
                 InputAction::WriteToClipboard(content)
+            } else if modifiers.alt {
+                // Ctrl+Alt+C → ESC + ^C (Meta-on-control).
+                InputAction::BackendCall(BackendCommand::Write(vec![0x1b, 0x03]))
             } else {
                 // Hotfix - Send ^C when there's not selection on view.
                 InputAction::BackendCall(BackendCommand::Write([0x3].to_vec()))
@@ -721,6 +750,29 @@ fn process_text_event(
     backend: &TerminalBackend,
     bindings_layout: &BindingsLayout,
 ) -> InputAction {
+    // xterm-style "Meta sends ESC": when Alt is held alongside a
+    // text-producing key (e.g. Alt+b for backward-word in readline),
+    // prepend ESC so the application sees a Meta-prefixed sequence
+    // rather than the bare letter. Skipped on macOS where Option is
+    // typically used to insert special characters (ç, π, …) and
+    // applications use Cmd for shortcuts.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let alt_prefix = modifiers.alt && !modifiers.ctrl && !modifiers.command;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let alt_prefix = false;
+
+    let write_bytes = |bytes: Vec<u8>| -> InputAction {
+        let payload = if alt_prefix {
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(0x1b);
+            out.extend_from_slice(&bytes);
+            out
+        } else {
+            bytes
+        };
+        InputAction::BackendCall(BackendCommand::Write(payload))
+    };
+
     if let Some(key) = Key::from_name(text) {
         if bindings_layout.get_action(
             InputKind::KeyCode(key),
@@ -728,16 +780,12 @@ fn process_text_event(
             backend.last_content().terminal_mode,
         ) == BindingAction::Ignore
         {
-            InputAction::BackendCall(BackendCommand::Write(
-                text.as_bytes().to_vec(),
-            ))
+            write_bytes(text.as_bytes().to_vec())
         } else {
             InputAction::Ignore
         }
     } else {
-        InputAction::BackendCall(BackendCommand::Write(
-            text.as_bytes().to_vec(),
-        ))
+        write_bytes(text.as_bytes().to_vec())
     }
 }
 
@@ -758,6 +806,60 @@ fn process_keyboard_key(
         modifiers,
         terminal_mode,
     );
+
+    // Ctrl+Alt+<key> = ESC + Ctrl+<key> (xterm Meta-on-control).
+    // No explicit binding exists for every Ctrl+Alt combination,
+    // so when the direct lookup misses, retry without Alt and
+    // prepend ESC if a Ctrl-binding exists. As a final fallback for
+    // printable keys with no Ctrl-binding (digits, punctuation),
+    // emit ESC + the literal character — matching what Alt-alone
+    // would produce (e.g. Ctrl+Alt+1 → "\x1b1", same as Alt+1).
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    if matches!(binding_action, BindingAction::Ignore)
+        && modifiers.alt
+        && modifiers.ctrl
+    {
+        let alt_stripped = Modifiers { alt: false, ..modifiers };
+        let inner = bindings_layout.get_action(
+            InputKind::KeyCode(key),
+            alt_stripped,
+            terminal_mode,
+        );
+        match inner {
+            BindingAction::Char(c) => {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                let mut out = Vec::with_capacity(s.len() + 1);
+                out.push(0x1b);
+                out.extend_from_slice(s.as_bytes());
+                return InputAction::BackendCall(BackendCommand::Write(out));
+            }
+            BindingAction::Esc(seq) => {
+                let mut out = Vec::with_capacity(seq.len() + 1);
+                out.push(0x1b);
+                out.extend_from_slice(seq.as_bytes());
+                return InputAction::BackendCall(BackendCommand::Write(out));
+            }
+            BindingAction::Ignore => {
+                // Final fallback: ESC + literal char for keys
+                // whose symbol_or_name() is a single printable
+                // ASCII character (digits, ".", ",", "/", …).
+                // Multi-char names ("Tab", "Enter", …) are
+                // skipped to avoid sending garbage.
+                let sym = key.symbol_or_name();
+                let mut chars = sym.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if c.is_ascii_graphic() {
+                        let lower = c.to_ascii_lowercase();
+                        return InputAction::BackendCall(BackendCommand::Write(
+                            vec![0x1b, lower as u8],
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     match binding_action {
         BindingAction::Char(c) => {

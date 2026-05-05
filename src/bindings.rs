@@ -188,7 +188,11 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         ArrowRight, Modifiers::COMMAND; BindingAction::Esc("\x1b[1;5C".into());
         End,          Modifiers::CTRL; BindingAction::Esc("\x1b[1;5F".into());
         Home,         Modifiers::CTRL; BindingAction::Esc("\x1b[1;5H".into());
+        // Ctrl+Backspace → ^H. Standard xterm behaviour — most
+        // terminals send the same code as Ctrl+H here.
+        Backspace,    Modifiers::CTRL; BindingAction::Char('\x08');
         Delete,       Modifiers::CTRL; BindingAction::Esc("\x1b[3;5~".into());
+        Insert,       Modifiers::CTRL; BindingAction::Esc("\x1b[2;5~".into());
         PageUp,       Modifiers::CTRL; BindingAction::Esc("\x1b[5;5~".into());
         PageDown,     Modifiers::CTRL; BindingAction::Esc("\x1b[6;5~".into());
         F1,           Modifiers::CTRL; BindingAction::Esc("\x1bO;5P".into());
@@ -303,6 +307,8 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         // CTRL + ALT
         End,        Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[1;7F".into());
         Home,       Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[1;7H".into());
+        Insert,     Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[2;7~".into());
+        Delete,     Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[3;7~".into());
         PageUp,     Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[5;7~".into());
         PageDown,   Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[6;7~".into());
         ArrowUp,    Modifiers::CTRL | Modifiers::ALT; BindingAction::Esc("\x1b[1;7A".into());
