@@ -212,6 +212,14 @@ pub struct TerminalBackend {
     sink: Sink,
     last_content: RenderableContent,
     dirty: Arc<AtomicBool>,
+    /// Monotonic counter incremented every time content is written or
+    /// scrolled. Unlike `dirty` (which the renderer clears each
+    /// frame), this keeps growing — callers can snapshot it and
+    /// compare later to know whether anything changed in between
+    /// without polling per-frame. Used by the periodic search
+    /// refresh: skip the scan if the buffer hasn't moved since the
+    /// last search ran.
+    content_revision: Arc<AtomicU64>,
     /// Shared flag for sticky-scroll (log mode): keep view stable as new content arrives.
     sticky_scroll: Option<Arc<AtomicBool>>,
 }
@@ -288,6 +296,7 @@ impl TerminalBackend {
             sink: Sink::EventLoop { notifier },
             last_content: initial_content,
             dirty,
+            content_revision: Arc::new(AtomicU64::new(0)),
             sticky_scroll: None,
         })
     }
@@ -360,6 +369,7 @@ impl TerminalBackend {
                 sink: Sink::EventLoop { notifier },
                 last_content: initial_content,
                 dirty,
+                content_revision: Arc::new(AtomicU64::new(0)),
                 sticky_scroll: None,
                 },
             handle,
@@ -401,12 +411,14 @@ impl TerminalBackend {
         let processor = Processor::new();
 
         let sticky_scroll = Arc::new(AtomicBool::new(false));
+        let content_revision = Arc::new(AtomicU64::new(0));
         let writer = DirectWriter {
             inner: Arc::new(DirectWriterInner {
                 term: term.clone(),
                 processor: Mutex::new(processor),
                 app_context: app_context.clone(),
                 dirty: dirty.clone(),
+                content_revision: content_revision.clone(),
                 sticky_scroll: sticky_scroll.clone(),
             }),
         };
@@ -448,6 +460,7 @@ impl TerminalBackend {
                 sink: Sink::Channel { input_tx, resize_tx },
                 last_content: initial_content,
                 dirty,
+                content_revision,
                 sticky_scroll: Some(sticky_scroll),
             },
             handle,
@@ -460,10 +473,17 @@ impl TerminalBackend {
         match cmd {
             BackendCommand::Write(input) => {
                 self.dirty.store(true, Ordering::Release);
+                self.content_revision.fetch_add(1, Ordering::Relaxed);
                 self.write(input);
                 term.scroll_display(Scroll::Bottom);
             },
             BackendCommand::Scroll(delta) => {
+                // `dirty` triggers a re-render so the new viewport
+                // band gets painted, but the underlying grid bytes
+                // didn't change — match Points are still where they
+                // were. Don't bump `content_revision`, otherwise
+                // mouse-wheel scrolling kicks `search_all` once a
+                // second for no reason.
                 self.dirty.store(true, Ordering::Release);
                 self.scroll(&mut term, delta);
             },
@@ -609,6 +629,15 @@ impl TerminalBackend {
         self.dirty.load(Ordering::Acquire)
     }
 
+    /// Snapshot of the content-revision counter. Bumped on any
+    /// write/scroll. Callers compare two snapshots to know whether
+    /// content changed in between, *without* polling per-frame the
+    /// way `is_dirty` requires (since `is_dirty` is cleared by the
+    /// renderer each frame).
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision.load(Ordering::Relaxed)
+    }
+
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
@@ -650,20 +679,92 @@ impl TerminalBackend {
     /// Returns all matches as `RangeInclusive<Point>`.
     pub fn search_all(&self, regex: &mut RegexSearch) -> Vec<Match> {
         let terminal = self.term.lock();
-        let total_lines = terminal.grid().total_lines();
-        let screen_lines = terminal.grid().screen_lines();
-        let history = total_lines.saturating_sub(screen_lines);
-        let start_line = Line(-(history as i32));
-        let end_line = terminal.bottommost_line();
-        let start = terminal.line_search_left(Point::new(start_line, Column(0)));
-        let end = terminal.line_search_right(Point::new(end_line, Column(0)));
-        RegexIter::new(start, end, Direction::Right, &terminal, regex).collect()
+        search_all_in_term(&terminal, regex)
+    }
+
+    /// Clone the underlying term `Arc<FairMutex<Term<_>>>` so a
+    /// caller can run `search_all_in_term_arc` from a worker
+    /// thread without holding any of `egui_term`'s state. Used by
+    /// Kubezilla's async search path which moves the full-buffer
+    /// regex scan off the UI thread.
+    pub fn term_arc(
+        &self,
+    ) -> std::sync::Arc<alacritty_terminal::sync::FairMutex<alacritty_terminal::Term<EventProxy>>>
+    {
+        self.term.clone()
     }
 
     /// Search only the visible viewport for a regex pattern.
     pub fn search_visible(&self, regex: &mut RegexSearch) -> Vec<Match> {
         let terminal = self.term.lock();
         visible_regex_match_iter(&terminal, regex).collect()
+    }
+
+    /// Convenience snapshot of grid dimensions for callers that
+    /// don't want to depend on alacritty's `Dimensions` trait
+    /// directly. Returns `(display_offset, screen_lines, columns,
+    /// total_lines, bottommost_line_index)` — everything the
+    /// async navigation paths need to compute viewport bounds.
+    pub fn grid_bounds(&self) -> GridBounds {
+        let terminal = self.term.lock();
+        let grid = terminal.grid();
+        GridBounds {
+            display_offset: grid.display_offset() as i32,
+            screen_lines: grid.screen_lines() as i32,
+            columns: grid.columns(),
+            total_lines: grid.total_lines(),
+            bottommost_line: terminal.bottommost_line().0,
+        }
+    }
+
+    /// Find the next regex match in the live grid starting *after*
+    /// `from`. Used by F3 / Enter navigation so we don't rely on
+    /// stale match `Point`s cached from an earlier `search_all`.
+    /// Returns `None` if no match exists between `from` and the
+    /// bottom of history.
+    ///
+    /// `from` is clamped into the current grid bounds before the
+    /// regex iterator runs — alacritty's `Grid::index` panics on
+    /// out-of-range Points, and stale anchors from streaming
+    /// content can easily produce them.
+    pub fn next_match_after(
+        &self,
+        regex: &mut RegexSearch,
+        from: Point,
+    ) -> Option<Match> {
+        let terminal = self.term.lock();
+        let bottom = terminal.bottommost_line();
+        let total_lines = terminal.grid().total_lines();
+        let screen_lines = terminal.grid().screen_lines();
+        let history = total_lines.saturating_sub(screen_lines) as i32;
+        let last_col = terminal.grid().columns().saturating_sub(1);
+        let from = Point::new(
+            Line(from.line.0.clamp(-history, bottom.0)),
+            Column(from.column.0.min(last_col)),
+        );
+        let end = Point::new(bottom, Column(last_col));
+        terminal.regex_search_right(regex, from, end)
+    }
+
+    /// Mirror of `next_match_after` for backward navigation.
+    pub fn prev_match_before(
+        &self,
+        regex: &mut RegexSearch,
+        from: Point,
+    ) -> Option<Match> {
+        let terminal = self.term.lock();
+        let total_lines = terminal.grid().total_lines();
+        let screen_lines = terminal.grid().screen_lines();
+        let history = total_lines.saturating_sub(screen_lines) as i32;
+        let bottom = terminal.bottommost_line().0;
+        let last_col = terminal.grid().columns().saturating_sub(1);
+        let from = Point::new(
+            Line(from.line.0.clamp(-history, bottom)),
+            Column(from.column.0.min(last_col)),
+        );
+        let top = Line(-history);
+        let start = Point::new(top, Column(0));
+        terminal.regex_search_left(regex, from, start)
     }
 
     /// Scroll the terminal so the given point is visible.
@@ -940,21 +1041,108 @@ impl TerminalBackend {
 
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.
+/// Run a full-buffer search against an already-locked `Term`.
+/// Lets external callers (e.g. Kubezilla's async search task) run
+/// the same `RegexIter::collect()` that `TerminalBackend::search_all`
+/// runs internally, but with their own lock acquisition timing —
+/// useful for `tokio::task::spawn_blocking` so the UI thread isn't
+/// stalled by a slow regex scan over a wide-grid streaming buffer.
+pub fn search_all_in_term(
+    term: &Term<EventProxy>,
+    regex: &mut RegexSearch,
+) -> Vec<Match> {
+    let total_lines = term.grid().total_lines();
+    let screen_lines = term.grid().screen_lines();
+    let history = total_lines.saturating_sub(screen_lines);
+    let start_line = Line(-(history as i32));
+    let end_line = term.bottommost_line();
+    let start = term.line_search_left(Point::new(start_line, Column(0)));
+    let end = term.line_search_right(Point::new(end_line, Column(0)));
+    RegexIter::new(start, end, Direction::Right, term, regex).collect()
+}
+
+/// Column-bounded version of `visible_regex_match_iter`. Only
+/// scans grid cells in `[min_col, max_col]` on each line, so the
+/// cost scales with *visible* width rather than full grid_cols.
+/// On a wrap-off log window with grid_cols=2000 and visible_cols
+/// ≈100, this cuts per-frame regex cost roughly 20×.
+///
+/// Returns matches that may extend past `max_col` (the regex
+/// engine still sees the full line content from `min_col` onward
+/// once it starts a match), but starts looking only at columns in
+/// the visible band — matches whose start is outside the band are
+/// never produced.
+pub fn visible_regex_match_iter_in_cols(
+    term: &Term<EventProxy>,
+    regex: &mut RegexSearch,
+    min_col: usize,
+    max_col: usize,
+    line_padding: i32,
+) -> Vec<Match> {
+    let viewport_start = Line(-(term.grid().display_offset() as i32));
+    let viewport_end = viewport_start + term.bottommost_line();
+    let topmost = term.topmost_line();
+    let bottommost = term.bottommost_line();
+    let line_lo = (viewport_start - line_padding).max(topmost);
+    let line_hi = (viewport_end + line_padding).min(bottommost);
+    let last_col = term.grid().columns().saturating_sub(1);
+    let mut matches = Vec::new();
+    let mut line = line_lo;
+    while line <= line_hi {
+        let row_start = Point::new(line, Column(min_col));
+        let row_end = Point::new(line, Column(max_col.min(last_col)));
+        let mut current = row_start;
+        loop {
+            match term.regex_search_right(regex, current, row_end) {
+                Some(m) => {
+                    let next_col = m.end().column.0.saturating_add(1);
+                    matches.push(m);
+                    if next_col > max_col || next_col > last_col {
+                        break;
+                    }
+                    current = Point::new(line, Column(next_col));
+                }
+                None => break,
+            }
+        }
+        line += alacritty_terminal::index::Line(1);
+    }
+    matches
+}
+
 pub fn visible_regex_match_iter<'a>(
     term: &'a Term<EventProxy>,
     regex: &'a mut RegexSearch,
 ) -> impl Iterator<Item = Match> + 'a {
+    // Padding around the visible viewport so matches that span the
+    // boundary are still found. Was 100 lines historically; that's
+    // dominant per-frame cost when the grid is wide (long-line /
+    // wrap-off log windows). 5 lines covers any realistic search
+    // pattern length and shrinks the regex engine's input by an
+    // order of magnitude on wide grids — the search-typing path
+    // becomes O(viewport) instead of O(viewport × 200).
+    const SCAN_PADDING: i32 = 5;
     let viewport_start = Line(-(term.grid().display_offset() as i32));
     let viewport_end = viewport_start + term.bottommost_line();
     let mut start =
         term.line_search_left(Point::new(viewport_start, Column(0)));
     let mut end = term.line_search_right(Point::new(viewport_end, Column(0)));
-    start.line = start.line.max(viewport_start - 100);
-    end.line = end.line.min(viewport_end + 100);
+    start.line = start.line.max(viewport_start - SCAN_PADDING);
+    end.line = end.line.min(viewport_end + SCAN_PADDING);
 
     RegexIter::new(start, end, Direction::Right, term, regex)
         .skip_while(move |rm| rm.end().line < viewport_start)
         .take_while(move |rm| rm.start().line <= viewport_end)
+}
+
+/// Public snapshot of grid geometry for navigation helpers.
+#[derive(Clone, Copy, Debug)]
+pub struct GridBounds {
+    pub display_offset: i32,
+    pub screen_lines: i32,
+    pub columns: usize,
+    pub total_lines: usize,
+    pub bottommost_line: i32,
 }
 
 pub struct RenderableContent {
@@ -1001,6 +1189,9 @@ struct DirectWriterInner {
     processor: Mutex<Processor>,
     app_context: egui::Context,
     dirty: Arc<AtomicBool>,
+    /// Mirror of TerminalBackend.content_revision so the writer can
+    /// bump it on every byte fed in.
+    content_revision: Arc<AtomicU64>,
     /// When true, keep view position stable as new content arrives (log mode).
     sticky_scroll: Arc<AtomicBool>,
 }
@@ -1030,6 +1221,7 @@ impl DirectWriter {
         }
 
         self.inner.dirty.store(true, Ordering::Release);
+        self.inner.content_revision.fetch_add(1, Ordering::Relaxed);
         drop(term);
         throttled_repaint(&self.inner.app_context);
     }

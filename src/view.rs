@@ -46,8 +46,52 @@ pub struct TerminalViewState {
     scrollbar_dragging: bool,
     /// Y offset from click point to thumb top, so thumb doesn't snap on grab
     scrollbar_grab_offset: f32,
+    /// Live position of the user's selected ("current") search
+    /// match, tracked across frames. Each render picks the visible
+    /// match closest to this Point and *updates* this Point to the
+    /// chosen match's start — so as streaming content shifts grid
+    /// Points by ±1 line, the orange highlight follows the same
+    /// physical match instead of flickering to whichever match
+    /// happens to be closest to a stale anchor. Reset whenever the
+    /// caller's `current_match_start` differs from this (i.e. user
+    /// pressed F3 and explicitly chose a new match).
+    tracked_current: Option<TerminalGridPoint>,
+    /// Last `current_match_start` seen from the caller. Used to
+    /// detect "user navigated" so we know to reset tracking.
+    last_caller_current: Option<TerminalGridPoint>,
     cached_shapes: Option<Vec<Shape>>,
     cached_rect: Option<Rect>,
+    /// Caller-supplied search state hash that produced the cached
+    /// shapes. When this differs from the next frame's hash the
+    /// cache is treated as stale (e.g. user typed a new query).
+    cached_search_key: u64,
+    /// Visible viewport rect for the cached frame. The scrollbar
+    /// position is rendered relative to this rect, so when the
+    /// window resizes (or horizontal pan changes) we must rebuild
+    /// the cache even if `cached_rect` (the grid's allocated rect)
+    /// hasn't moved.
+    cached_visible: Option<Rect>,
+    /// Horizontal column offset of the cached frame. Wrap-off
+    /// mode pans the visible column band of a wide grid via
+    /// `set_horizontal_offset_cols`; cache must invalidate the
+    /// instant the user drags the scrollbar so the new column
+    /// slice paints immediately rather than waiting on the
+    /// `last_render_at` throttle.
+    cached_h_offset: usize,
+    /// Caller-supplied "current" match anchor for the cached frame.
+    /// F3 navigation only mutates this Point — the search query and
+    /// flags are unchanged, so `cached_search_key` matches and fast
+    /// path #1 would otherwise reuse stale shapes with the orange
+    /// highlight on the previous match. Including this Point in the
+    /// cache key invalidates immediately on F3, so the next frame
+    /// repaints orange on the new match.
+    cached_current_match: Option<TerminalGridPoint>,
+    /// Last time we built a fresh shape list. Used to cap render
+    /// frequency on viewports where new content arrives constantly
+    /// (multi-pod log streams) — `is_dirty()` is essentially always
+    /// true in those cases, so we use a short-window cache as the
+    /// real throttle.
+    last_render_at: Option<std::time::Instant>,
     /// Whether the last render included search highlights (to invalidate cache on change).
     had_highlights: bool,
 }
@@ -68,6 +112,27 @@ pub struct TerminalView<'a> {
     read_only: bool,
     /// When true, the cursor block is not drawn.
     hide_cursor: bool,
+    /// Optional override for the alacritty grid's column count.
+    /// When set, the widget keeps its rendered allocation at
+    /// `self.size` (viewport width) but resizes the internal grid
+    /// to this many columns — used by Kubezilla's "no-wrap" log
+    /// view to render long lines without wrapping. Combine with
+    /// `set_horizontal_offset_cols` to scroll horizontally without
+    /// an outer `ScrollArea`.
+    grid_columns_override: Option<usize>,
+    /// Column offset applied when rendering. Cells with column
+    /// `< offset` or `>= offset + visible_cols` are skipped; the
+    /// remaining cells are drawn at `(col - offset) × cell_width`,
+    /// so the rendered output looks like a horizontally-panned
+    /// view of the wide grid.
+    horizontal_offset_cols: usize,
+    /// Opaque caller-supplied hash of the current search state
+    /// (query + flags). Included in the render cache key so the
+    /// cache invalidates the moment the user changes their search
+    /// — without this, fast-path #1 can't fire while search is
+    /// active because the widget can't tell whether the matches
+    /// it cached are still correct. Defaults to 0 (no search).
+    search_key: u64,
 }
 
 impl Widget for TerminalView<'_> {
@@ -82,10 +147,19 @@ impl Widget for TerminalView<'_> {
                 .unwrap_or_default()
         });
 
+        // Capture the clip rect *now*, while we still have a `&Ui`.
+        // When the widget is inside a `ScrollArea` (Kubezilla's no-
+        // wrap log mode), `layout.rect` extends beyond the visible
+        // viewport — but the clip rect is exactly the visible
+        // window. We pin the vertical scrollbar to the *clip's*
+        // right edge so it stays on-screen no matter how the user
+        // pans horizontally.
+        let visible_rect = ui.clip_rect().intersect(layout.rect);
+
         self.focus(&layout)
             .resize(&layout)
-            .process_input(&layout, &mut state)
-            .show(&mut state, &layout, &painter);
+            .process_input(&layout, &visible_rect, &mut state)
+            .show(&mut state, &layout, &visible_rect, &painter);
 
         ui.memory_mut(|m| m.data.insert_temp(widget_id, state));
         layout
@@ -112,7 +186,42 @@ impl<'a> TerminalView<'a> {
             current_match_start: None,
             read_only: false,
             hide_cursor: false,
+            grid_columns_override: None,
+            horizontal_offset_cols: 0,
+            search_key: 0,
         }
+    }
+
+    /// Caller-supplied hash of the current search state. Used as
+    /// part of the render cache key so the cache invalidates when
+    /// the user types a new query, toggles case sensitivity, etc.
+    /// Pass 0 when no search is active. The widget never inspects
+    /// the value beyond `==` comparison with the cached one.
+    #[inline]
+    pub fn set_search_key(mut self, key: u64) -> Self {
+        self.search_key = key;
+        self
+    }
+
+    /// Override the alacritty grid's column count — the rendered
+    /// widget still occupies only `self.size`, but internally the
+    /// terminal can hold lines longer than the viewport. Pair with
+    /// `set_horizontal_offset_cols` to pan a window across the
+    /// wider grid without using an outer `ScrollArea`.
+    #[inline]
+    pub fn set_grid_columns(mut self, cols: Option<usize>) -> Self {
+        self.grid_columns_override = cols;
+        self
+    }
+
+    /// Render starting at this column. Cells in `[offset, offset +
+    /// visible_cols)` are drawn at `(col - offset) * cell_width`;
+    /// other cells are skipped. Used together with
+    /// `set_grid_columns` for a no-wrap log view.
+    #[inline]
+    pub fn set_horizontal_offset_cols(mut self, offset: usize) -> Self {
+        self.horizontal_offset_cols = offset;
+        self
     }
 
     #[inline]
@@ -185,9 +294,22 @@ impl<'a> TerminalView<'a> {
     }
 
     fn resize(self, layout: &Response) -> Self {
+        let font_size = self.font.font_measure(&layout.ctx);
+        // When the caller has overridden the grid column count,
+        // resize the alacritty grid to that wider width. The
+        // rendered widget still occupies `layout.rect.size()` but
+        // internally the grid can hold longer lines so the no-wrap
+        // log view doesn't fold them.
+        let logical_size = if let Some(cols) = self.grid_columns_override {
+            let cell_w = font_size.width;
+            let grid_w = (cols as f32 * cell_w).max(layout.rect.size().x);
+            egui::vec2(grid_w, layout.rect.size().y)
+        } else {
+            layout.rect.size()
+        };
         self.backend.process_command(BackendCommand::Resize(
-            Size::from(layout.rect.size()),
-            self.font.font_measure(&layout.ctx),
+            Size::from(logical_size),
+            font_size,
         ));
 
         self
@@ -196,6 +318,7 @@ impl<'a> TerminalView<'a> {
     fn process_input(
         self,
         layout: &Response,
+        visible_rect: &egui::Rect,
         state: &mut TerminalViewState,
     ) -> Self {
         let has_focus = layout.has_focus();
@@ -228,8 +351,12 @@ impl<'a> TerminalView<'a> {
             });
         }
 
-        // Scrollbar occupies the rightmost 8px of the layout
-        let scrollbar_x = layout.rect.max.x - 8.0;
+        // Scrollbar occupies the rightmost 8px of the *visible*
+        // viewport (the clip rect intersected with our allocation).
+        // When the widget extends past the visible area inside a
+        // ScrollArea, this keeps the scrollbar pinned where the
+        // user can actually see and click it.
+        let scrollbar_x = visible_rect.max.x - 8.0;
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
@@ -329,30 +456,54 @@ impl<'a> TerminalView<'a> {
         mut self,
         state: &mut TerminalViewState,
         layout: &Response,
+        visible_rect: &egui::Rect,
         painter: &Painter,
     ) {
-        let has_search = self.search_regex.is_some();
+        let _has_search = self.search_regex.is_some();
 
-        // Check if pointer is interacting with the scrollbar area
-        let scrollbar_x = layout.rect.max.x - 8.0;
+        // Scrollbar lives at the right edge of the visible viewport
+        // (so it stays on-screen even when the grid is wider than
+        // the ScrollArea's clip rect).
+        let scrollbar_x = visible_rect.max.x - 8.0;
         let pointer_on_scrollbar = layout.ctx.input(|i| {
             if let Some(pos) = i.pointer.hover_pos() {
                 (i.pointer.primary_pressed() || i.pointer.primary_down())
                     && pos.x >= scrollbar_x
-                    && layout.rect.contains(pos)
+                    && visible_rect.contains(pos)
             } else {
                 false
             }
         });
 
-        // Fast path: if terminal is not dirty, no scrollbar interaction,
-        // no search (and none last frame), and we have a cached frame for the same rect, reuse it.
+        // Fast path #1: nothing changed since last frame — reuse
+        // the cached shapes verbatim. Cache key is BOTH the grid
+        // rect (so resize triggers rebuild) AND the visible rect
+        // (so window resize / horizontal pan also rebuilds — the
+        // scrollbar position is computed relative to `visible_rect`
+        // and would otherwise stick at the previous viewport edge).
+        // Rounded to integer pixels because egui's `ScrollArea`
+        // clip rect drifts by sub-pixel amounts every frame on
+        // some layouts; an exact `Rect == Rect` comparison would
+        // miss the cache forever and force a full render per
+        // frame in no-wrap mode.
+        let key_layout = round_rect_int(layout.rect);
+        let key_visible = round_rect_int(*visible_rect);
+        let cache_key_matches = state.cached_rect == Some(key_layout)
+            && state.cached_visible == Some(key_visible)
+            && state.cached_h_offset == self.horizontal_offset_cols
+            && state.cached_search_key == self.search_key
+            && state.cached_current_match == self.current_match_start;
+
+        // Fast path #1: nothing meaningful has changed since the
+        // cached frame — same buffer (`!is_dirty`), same layout,
+        // same horizontal offset, same search state. Reuse the
+        // shapes verbatim. Now fires even when a search is active,
+        // so an idle viewport with highlights doesn't pay the per-
+        // frame `visible_regex_match_iter` + BTreeSet build.
         if !self.backend.is_dirty()
             && !state.scrollbar_dragging
             && !pointer_on_scrollbar
-            && !has_search
-            && !state.had_highlights
-            && state.cached_rect == Some(layout.rect)
+            && cache_key_matches
         {
             if let Some(ref shapes) = state.cached_shapes {
                 painter.extend(shapes.clone());
@@ -360,7 +511,32 @@ impl<'a> TerminalView<'a> {
             }
         }
 
-        // Single lock for both metadata sync and rendering
+        // Fast path #2: the buffer is dirty, but we rendered very
+        // recently. Re-using the cached shapes for one more frame
+        // caps effective render rate on streaming logs where 100+
+        // pods set `is_dirty` on every batch flush. The actual
+        // contents are at most ~33 ms behind — imperceptible — and
+        // we save a full grid scan, lock acquisition, and shape
+        // rebuild. Schedule a wake so we don't fall idle behind a
+        // dirty bit that'll keep firing.
+        const RENDER_THROTTLE: std::time::Duration =
+            std::time::Duration::from_millis(33);
+        let recently_rendered = state
+            .last_render_at
+            .map(|t| t.elapsed() < RENDER_THROTTLE)
+            .unwrap_or(false);
+        if recently_rendered
+            && cache_key_matches
+            && !state.scrollbar_dragging
+            && !pointer_on_scrollbar
+        {
+            if let Some(ref shapes) = state.cached_shapes {
+                painter.extend(shapes.clone());
+                layout.ctx.request_repaint_after(RENDER_THROTTLE);
+                return;
+            }
+        }
+
         let term_arc = self.backend.term().clone();
         let mut terminal = term_arc.lock();
         self.backend.sync_with_term(&mut terminal);
@@ -375,70 +551,246 @@ impl<'a> TerminalView<'a> {
         let display_offset = content.display_offset;
         let cursor_point = content.cursor_point;
 
-        // Compute visible search matches once (cheap — only visible viewport).
-        // Store as sorted Vec of match ranges for binary-search lookup.
-        let mut highlight_matches: Vec<std::ops::RangeInclusive<TerminalGridPoint>> = Vec::new();
+        // Compute visible search matches once. Match ranges are
+        // expanded into a BTreeSet of grid points so the per-cell
+        // highlight check is O(log n) instead of O(matches × cells).
+        // BTreeSet (not HashSet) because alacritty's `Point` only
+        // implements `Ord`.
+        //
+        // The scan range itself is bounded to viewport ± 5 lines via
+        // `visible_regex_match_iter`, so cost is O(viewport) rather
+        // than O(viewport + 200) which used to dominate frame time
+        // on wide-grid (no-wrap) windows during search typing.
+        let term_columns = terminal.grid().columns();
+        let mut highlight_cells: std::collections::BTreeSet<TerminalGridPoint> =
+            std::collections::BTreeSet::new();
+        let mut current_cells: std::collections::BTreeSet<TerminalGridPoint> =
+            std::collections::BTreeSet::new();
         let mut current_match: Option<std::ops::RangeInclusive<TerminalGridPoint>> = None;
-        if let Some(ref mut regex) = self.search_regex {
-            for m in crate::backend::visible_regex_match_iter(&terminal, regex) {
-                if self.current_match_start.as_ref() == Some(m.start()) {
-                    current_match = Some(m);
-                } else {
-                    highlight_matches.push(m);
-                }
-            }
-        }
-        let has_any_highlights = current_match.is_some() || !highlight_matches.is_empty();
 
-        let mut shapes = vec![Shape::Rect(RectShape::filled(
+        // Pre-allocate Vec with a generous upper-bound capacity.
+        // Per frame we push 1-2 shapes per visible cell, so the
+        // final Vec is typically 4000-10000 entries. Without
+        // preallocation Vec doubles ~12 times and copies all
+        // elements on each grow — measurable when called every
+        // frame on streaming logs.
+        let mut shapes: Vec<Shape> = Vec::with_capacity(16384);
+        shapes.push(Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
             CornerRadius::ZERO,
             global_bg,
-        ))];
+        )));
 
-        for indexed in terminal.grid().display_iter() {
-            let flags = indexed.cell.flags;
-            let is_wide_char_spacer =
-                flags.contains(cell::Flags::WIDE_CHAR_SPACER);
-            if is_wide_char_spacer {
-                continue;
+        // Visible column band on the *grid* (not on the painter
+        // viewport) — this is the slice of the grid the user
+        // actually sees. With `horizontal_offset_cols` set, the
+        // band is `[offset, offset + visible_cols_in_viewport]`.
+        // Cells outside this band are skipped before any per-cell
+        // work; cells inside are drawn at `x = layout_min.x +
+        // (col - offset) * cell_width` so they appear at the
+        // viewport's left edge.
+        let visible_cols_in_viewport: i32 = if cell_width > 0.0 {
+            ((layout_max.x - layout_min.x) / cell_width).ceil() as i32
+        } else {
+            term_columns as i32
+        };
+        let h_offset_cols = self.horizontal_offset_cols as i32;
+        let visible_min_col = h_offset_cols;
+        let visible_max_col = h_offset_cols + visible_cols_in_viewport;
+
+        // Now that we know the visible column band, expand search
+        // matches — but skip ones that fall entirely outside the
+        // visible columns. In wrap-off mode the grid is much wider
+        // than the viewport; matches in off-screen columns can't
+        // be highlighted anyway, so building BTreeSet entries for
+        // them is dead work. This is the difference that makes
+        // search feel as smooth in wrap-off as in wrap-on.
+        // The orange "current" highlight tracks a Point that
+        // *follows* the user's selected match as streaming
+        // content shifts the grid. `tracked_current` carries that
+        // Point across frames (mutated below to whatever match
+        // we paint orange), and we reset it only when the caller
+        // hands us a different `current_match_start` than we last
+        // saw — i.e. the user explicitly navigated.
+        if self.current_match_start != state.last_caller_current {
+            state.tracked_current = self.current_match_start;
+            state.last_caller_current = self.current_match_start;
+        }
+        let target_point: Option<TerminalGridPoint> = state
+            .tracked_current
+            .or(self.current_match_start);
+
+        // Two-pass match handling so the "current" (orange)
+        // highlight is stable across streaming-induced grid
+        // shifts. Pass 1: collect all visible matches and find
+        // the one *closest* to `target_point`. Pass 2: expand
+        // into the right BTreeSet (current vs. all-others).
+        let mut visible_matches: Vec<
+            std::ops::RangeInclusive<TerminalGridPoint>,
+        > = Vec::new();
+        let mut closest_idx: Option<usize> = None;
+        let mut closest_score: u64 = u64::MAX;
+        if let Some(ref mut regex) = self.search_regex {
+            // Use the column-bounded variant: only scans grid cells
+            // in the visible column band. With wide wrap-off grids
+            // (2000+ cols) this cuts the regex-iter cost ~20× vs
+            // the full-line scan that `visible_regex_match_iter`
+            // does.
+            let scan_min = visible_min_col.max(0) as usize;
+            let scan_max =
+                visible_max_col.max(visible_min_col) as usize;
+            let bounded =
+                crate::backend::visible_regex_match_iter_in_cols(
+                    &terminal, regex, scan_min, scan_max, 5,
+                );
+            for m in bounded {
+                let m_start_col = m.start().column.0 as i32;
+                let m_end_col = m.end().column.0 as i32;
+                let touches_visible = m_end_col >= visible_min_col
+                    && m_start_col <= visible_max_col
+                    || m.start().line != m.end().line;
+                if !touches_visible {
+                    continue;
+                }
+                if let Some(target) = target_point.as_ref() {
+                    // Manhattan distance in (line, col) space —
+                    // line dominates so we prefer matches on the
+                    // same row when scrolling horizontally.
+                    let s = m.start();
+                    let dline = (s.line.0 - target.line.0).unsigned_abs() as u64;
+                    let dcol = (s.column.0 as i64 - target.column.0 as i64)
+                        .unsigned_abs();
+                    let score = dline * 1_000_000 + dcol;
+                    if score < closest_score {
+                        closest_score = score;
+                        closest_idx = Some(visible_matches.len());
+                    }
+                }
+                visible_matches.push(m);
             }
+        }
+        // Acceptable matches:
+        //   - Exact Point match (score == 0), OR
+        //   - Same column, within N lines of target (streaming
+        //     logs append new lines which shifts existing matches'
+        //     Line index but never their Column).
+        //
+        // Same-column requirement is what distinguishes a
+        // streaming-shift "follow" from a horizontal-pan "skip":
+        // pan changes which columns are visible (columns differ
+        // → reject), streaming changes which lines exist at a
+        // given Point (columns same → accept). This way the
+        // orange follows its physical match through streaming
+        // bursts (between 1s `search_all` refreshes) without ever
+        // snapping to a *different* match.
+        const STREAMING_LINE_TOLERANCE: u64 = 200;
+        let acceptable = closest_idx.map_or(false, |_| {
+            let dline = closest_score / 1_000_000;
+            let dcol = closest_score % 1_000_000;
+            dline == 0 && dcol == 0
+                || (dcol == 0 && dline <= STREAMING_LINE_TOLERANCE)
+        });
+        if !acceptable {
+            closest_idx = None;
+        }
+        for (i, m) in visible_matches.into_iter().enumerate() {
+            let is_current = Some(i) == closest_idx;
+            if is_current {
+                current_match = Some(m.clone());
+                // Re-anchor `tracked_current` to whatever match
+                // we picked. Next frame this Point becomes the
+                // target, so the orange stays attached to the
+                // *same physical match* even as streaming content
+                // shifts grid coordinates underneath it.
+                state.tracked_current = Some(*m.start());
+            }
+            let target = if is_current {
+                &mut current_cells
+            } else {
+                &mut highlight_cells
+            };
+            expand_match_into_cells(m, term_columns, target);
+        }
+        let has_any_highlights =
+            !current_cells.is_empty() || !highlight_cells.is_empty();
 
-            let is_app_cursor_mode =
-                content.terminal_mode.contains(TermMode::APP_CURSOR);
-            let is_wide_char = flags.contains(cell::Flags::WIDE_CHAR);
-            let is_inverse = flags.contains(cell::Flags::INVERSE);
-            let is_dim =
-                flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD);
-            let is_selected = content
-                .selectable_range
-                .is_some_and(|r| r.contains(indexed.point));
-            let is_hovered_hyperling =
-                content.hovered_hyperlink.as_ref().is_some_and(|r| {
-                    r.contains(&indexed.point)
-                        && r.contains(&state.current_mouse_position_on_grid)
-                });
+        // Manual iteration over only visible rows × visible cols.
+        // `display_iter` walks every cell of the grid (~26k yields
+        // for a 526×50 grid even with column-band skips), and each
+        // yield costs ~1 µs of iterator advance overhead. Direct
+        // `grid[Line][Column]` access skips the iterator entirely
+        // — for ~80 visible cols × ~50 rows, that's 4k iterations
+        // instead of 26k. ~6× speedup on the per-frame cell loop,
+        // which previous profiling showed at 25 ms.
+        //
+        // The whole loop runs inside ONE `painter.fonts_mut(...)`
+        // call. Each `painter.fonts_mut` internally takes the egui
+        // Context's *write lock* (`ctx.write(...)`); per-cell calls
+        // were paying that lock-acquire cost ~6000 times per frame
+        // and dominated `cells_us`. With the lock hoisted out of
+        // the inner loop, only one lock cycle per frame.
+        let grid = terminal.grid();
+        let display_offset_i32 = display_offset as i32;
+        let screen_lines_i32 = grid.screen_lines() as i32;
+        let total_columns = grid.columns();
+        let col_start_idx = visible_min_col.max(0) as usize;
+        let col_end_idx = (visible_max_col + 1).max(0) as usize;
+        let col_end_idx = col_end_idx.min(total_columns);
+        let is_app_cursor_mode = content.terminal_mode.contains(TermMode::APP_CURSOR);
+        let font_type = self.font.font_type();
+        let hide_cursor = self.hide_cursor;
+        let theme = &self.theme;
+        let mouse_pos = state.current_mouse_position_on_grid;
+        painter.fonts_mut(|fonts| {
+        for line_idx in 0..screen_lines_i32 {
+            let viewport_line =
+                alacritty_terminal::index::Line(line_idx - display_offset_i32);
+            for col_idx in col_start_idx..col_end_idx {
+                let column = alacritty_terminal::index::Column(col_idx);
+                let point = alacritty_terminal::index::Point::new(
+                    viewport_line, column,
+                );
+                let cell = &grid[viewport_line][column];
 
-            // Check search highlights
-            let highlight_kind = if has_any_highlights {
-                if current_match.as_ref().is_some_and(|r| r.contains(&indexed.point)) {
-                    HighlightKind::Current
-                } else if highlight_matches.iter().any(|r| r.contains(&indexed.point)) {
-                    HighlightKind::Match
+                let flags = cell.flags;
+                let is_wide_char_spacer =
+                    flags.contains(cell::Flags::WIDE_CHAR_SPACER);
+                if is_wide_char_spacer {
+                    continue;
+                }
+
+                let is_wide_char = flags.contains(cell::Flags::WIDE_CHAR);
+                let is_inverse = flags.contains(cell::Flags::INVERSE);
+                let is_dim =
+                    flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD);
+                let is_selected = content
+                    .selectable_range
+                    .is_some_and(|r| r.contains(point));
+                let is_hovered_hyperling =
+                    content.hovered_hyperlink.as_ref().is_some_and(|r| {
+                        r.contains(&point) && r.contains(&mouse_pos)
+                    });
+
+                let highlight_kind = if has_any_highlights {
+                    if current_cells.contains(&point) {
+                        HighlightKind::Current
+                    } else if highlight_cells.contains(&point) {
+                        HighlightKind::Match
+                    } else {
+                        HighlightKind::None
+                    }
                 } else {
                     HighlightKind::None
-                }
-            } else {
-                HighlightKind::None
-            };
+                };
 
-            let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
-            let line_num =
-                indexed.point.line.0 + display_offset as i32;
-            let y = layout_min.y + (cell_height * line_num as f32);
+                let col = col_idx as i32;
+                let x = layout_min.x
+                    + (cell_width * (col - h_offset_cols) as f32);
+                let line_num = viewport_line.0 + display_offset as i32;
+                let y = layout_min.y + (cell_height * line_num as f32);
 
-            let mut fg = self.theme.get_color(indexed.fg);
-            let mut bg = self.theme.get_color(indexed.bg);
+                let mut fg = theme.get_color(cell.fg);
+                let mut bg = theme.get_color(cell.bg);
             let cell_width = if is_wide_char {
                 cell_width * 2.0
             } else {
@@ -476,54 +828,57 @@ impl<'a> TerminalView<'a> {
                 )));
             }
 
-            if is_hovered_hyperling {
-                let underline_height = y + cell_height;
-                shapes.push(Shape::LineSegment {
-                    points: [
-                        Pos2::new(x, underline_height),
-                        Pos2::new(x + cell_width, underline_height),
-                    ],
-                    stroke: Stroke::new(cell_height * 0.15, fg),
-                });
-            }
-
-            if cursor_point == indexed.point && !self.hide_cursor {
-                let cursor_color = self.theme.get_color(content.cursor.fg);
-                shapes.push(Shape::Rect(RectShape::filled(
-                    Rect::from_min_size(
-                        Pos2::new(x, y),
-                        Vec2::new(cell_width, cell_height),
-                    ),
-                    CornerRadius::default(),
-                    cursor_color,
-                )));
-            }
-
-            if indexed.c != ' ' && indexed.c != '\t' {
-                if cursor_point == indexed.point
-                    && is_app_cursor_mode
-                    && !self.hide_cursor
-                {
-                    std::mem::swap(&mut fg, &mut bg);
+                if is_hovered_hyperling {
+                    let underline_height = y + cell_height;
+                    shapes.push(Shape::LineSegment {
+                        points: [
+                            Pos2::new(x, underline_height),
+                            Pos2::new(x + cell_width, underline_height),
+                        ],
+                        stroke: Stroke::new(cell_height * 0.15, fg),
+                    });
                 }
 
-                shapes.push(painter.fonts_mut(|c| {
-                    Shape::text(
-                        c,
+                if cursor_point == point && !hide_cursor {
+                    let cursor_color = theme.get_color(content.cursor.fg);
+                    shapes.push(Shape::Rect(RectShape::filled(
+                        Rect::from_min_size(
+                            Pos2::new(x, y),
+                            Vec2::new(cell_width, cell_height),
+                        ),
+                        CornerRadius::default(),
+                        cursor_color,
+                    )));
+                }
+
+                if cell.c != ' ' && cell.c != '\t' {
+                    if cursor_point == point
+                        && is_app_cursor_mode
+                        && !hide_cursor
+                    {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+
+                    shapes.push(Shape::text(
+                        fonts,
                         Pos2 {
                             x: x + (cell_width / 2.0),
                             y,
                         },
                         Align2::CENTER_TOP,
-                        indexed.c,
-                        self.font.font_type(),
+                        cell.c,
+                        font_type.clone(),
                         fg,
-                    )
-                }));
-            }
-        }
+                    ));
+                }
+            } // end col loop
+        } // end row loop
+        }); // end painter.fonts_mut
 
-        // Draw border around current search match
+        // Draw border around current search match.
+        // X positions follow the same `(col - h_offset_cols) * cell_width`
+        // formula as cell drawing above, so the border tracks the
+        // visible band when the user pans horizontally in wrap-off mode.
         if let Some(ref cm) = current_match {
             let cols = terminal.grid().columns();
             let start = *cm.start();
@@ -533,8 +888,11 @@ impl<'a> TerminalView<'a> {
 
             if start.line == end.line {
                 // Single-line match: one border rect
-                let x1 = layout_min.x + (cell_width * start.column.0 as f32);
-                let x2 = layout_min.x + (cell_width * (end.column.0 as f32 + 1.0));
+                let x1 = layout_min.x
+                    + (cell_width * (start.column.0 as i32 - h_offset_cols) as f32);
+                let x2 = layout_min.x
+                    + (cell_width
+                        * (end.column.0 as i32 + 1 - h_offset_cols) as f32);
                 let line_num = start.line.0 + display_offset as i32;
                 let y = layout_min.y + (cell_height * line_num as f32);
                 let rect = Rect::from_min_size(
@@ -550,8 +908,10 @@ impl<'a> TerminalView<'a> {
                     let y = layout_min.y + (cell_height * line_num as f32);
                     let col_start = if line == start.line { start.column.0 } else { 0 };
                     let col_end = if line == end.line { end.column.0 + 1 } else { cols };
-                    let x1 = layout_min.x + (cell_width * col_start as f32);
-                    let x2 = layout_min.x + (cell_width * col_end as f32);
+                    let x1 = layout_min.x
+                        + (cell_width * (col_start as i32 - h_offset_cols) as f32);
+                    let x2 = layout_min.x
+                        + (cell_width * (col_end as i32 - h_offset_cols) as f32);
                     let rect = Rect::from_min_size(
                         Pos2::new(x1, y),
                         Vec2::new(x2 - x1, cell_height),
@@ -569,9 +929,14 @@ impl<'a> TerminalView<'a> {
 
         if history_size > 0 {
             let scrollbar_width = 8.0_f32;
+            // Pin to the visible viewport's right edge — that's
+            // where the user can actually see and click. The track's
+            // y range is still clamped to the visible vertical band
+            // so thumb positioning math stays consistent with the
+            // viewport, not the off-screen grid.
             let track_rect = Rect::from_min_max(
-                Pos2::new(layout_max.x - scrollbar_width, layout_min.y),
-                layout_max,
+                Pos2::new(visible_rect.max.x - scrollbar_width, visible_rect.min.y),
+                Pos2::new(visible_rect.max.x, visible_rect.max.y),
             );
             let track_height = track_rect.height();
             let thumb_frac = screen_lines as f32 / total_lines as f32;
@@ -676,11 +1041,65 @@ impl<'a> TerminalView<'a> {
 
         drop(terminal);
 
-        // Cache shapes for reuse when terminal is idle
+        // Cache shapes for reuse when terminal is idle and for the
+        // dirty-but-throttled fast path on streaming logs. Cache
+        // keys are integer-rounded so sub-pixel drift in the
+        // surrounding layout doesn't invalidate the cache.
         state.cached_shapes = Some(shapes.clone());
-        state.cached_rect = Some(layout.rect);
+        state.cached_rect = Some(round_rect_int(layout.rect));
+        state.cached_visible = Some(round_rect_int(*visible_rect));
+        state.cached_h_offset = self.horizontal_offset_cols;
+        state.cached_search_key = self.search_key;
+        state.cached_current_match = self.current_match_start;
+        state.last_render_at = Some(std::time::Instant::now());
         state.had_highlights = has_any_highlights;
         painter.extend(shapes);
+    }
+}
+
+/// Round a `Rect` to integer pixels. Used as a cache key so
+/// sub-pixel drift from layout float math doesn't force a fresh
+/// render every frame.
+fn round_rect_int(r: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(r.min.x.round(), r.min.y.round()),
+        egui::pos2(r.max.x.round(), r.max.y.round()),
+    )
+}
+
+/// Expand an inclusive grid-point range into a set of every cell it
+/// covers, line-by-line. Used to flatten search-match ranges into a
+/// BTreeSet so the per-cell highlight check during render is O(log n).
+fn expand_match_into_cells(
+    range: std::ops::RangeInclusive<TerminalGridPoint>,
+    term_columns: usize,
+    out: &mut std::collections::BTreeSet<TerminalGridPoint>,
+) {
+    use alacritty_terminal::index::{Column, Line};
+    let start = *range.start();
+    let end = *range.end();
+    let last_col = term_columns.saturating_sub(1);
+    if start.line == end.line {
+        for c in start.column.0..=end.column.0 {
+            out.insert(TerminalGridPoint::new(start.line, Column(c)));
+        }
+        return;
+    }
+    // First line: from start.column to end of line.
+    for c in start.column.0..=last_col {
+        out.insert(TerminalGridPoint::new(start.line, Column(c)));
+    }
+    // Middle lines: every column.
+    let mut line = start.line.0 + 1;
+    while line < end.line.0 {
+        for c in 0..=last_col {
+            out.insert(TerminalGridPoint::new(Line(line), Column(c)));
+        }
+        line += 1;
+    }
+    // Last line: from 0 to end.column.
+    for c in 0..=end.column.0 {
+        out.insert(TerminalGridPoint::new(end.line, Column(c)));
     }
 }
 
