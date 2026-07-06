@@ -234,6 +234,14 @@ impl TerminalBackend {
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
             working_directory: settings.working_directory,
+            // Merge host-provided env (e.g. KUBECONFIG) into the child's
+            // inherited environment — custom values win on both platforms.
+            env: settings.env,
+            // Escape Windows args per C-runtime rules so multi-word args
+            // (our `--settings {json}` / prompts) survive CreateProcessW.
+            // The field only exists on Windows.
+            #[cfg(target_os = "windows")]
+            escape_args: true,
             ..tty::Options::default()
         };
         let config = term::Config::default();

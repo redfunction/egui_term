@@ -285,7 +285,16 @@ impl<'a> TerminalView<'a> {
 
     fn focus(self, layout: &Response) -> Self {
         if self.has_focus {
-            layout.request_focus();
+            // Only claim focus when no *other* widget already holds it —
+            // otherwise the terminal yanks focus away from e.g. an open search
+            // box on every frame. When focus is free (or already ours) we take
+            // it so keystrokes reach the PTY.
+            let taken_by_other = layout
+                .ctx
+                .memory(|m| m.focused().is_some_and(|f| f != layout.id));
+            if !taken_by_other {
+                layout.request_focus();
+            }
         } else {
             layout.surrender_focus();
         }
@@ -548,6 +557,15 @@ impl<'a> TerminalView<'a> {
         let cell_width = content.terminal_size.cell_width as f32;
         let global_bg =
             self.theme.get_color(Color::Named(NamedColor::Background));
+        // Subtle selection tint (22% foreground over background) so
+        // selecting empty cells doesn't paint solid inverted blocks.
+        let global_fg =
+            self.theme.get_color(Color::Named(NamedColor::Foreground));
+        let selection_bg = egui::Color32::from_rgb(
+            (global_bg.r() as f32 * 0.78 + global_fg.r() as f32 * 0.22) as u8,
+            (global_bg.g() as f32 * 0.78 + global_fg.g() as f32 * 0.22) as u8,
+            (global_bg.b() as f32 * 0.78 + global_fg.b() as f32 * 0.22) as u8,
+        );
         let display_offset = content.display_offset;
         let cursor_point = content.cursor_point;
 
@@ -739,6 +757,9 @@ impl<'a> TerminalView<'a> {
         let is_app_cursor_mode = content.terminal_mode.contains(TermMode::APP_CURSOR);
         let font_type = self.font.font_type();
         let hide_cursor = self.hide_cursor;
+        // Focused → solid block cursor; unfocused (e.g. the search box has focus)
+        // → hollow outline, so it's visually clear keystrokes go elsewhere.
+        let cursor_focused = layout.has_focus();
         let theme = &self.theme;
         let mouse_pos = state.current_mouse_position_on_grid;
         painter.fonts_mut(|fonts| {
@@ -801,8 +822,15 @@ impl<'a> TerminalView<'a> {
                 fg = fg.linear_multiply(0.7);
             }
 
-            if is_inverse || is_selected {
+            // ANSI reverse video genuinely swaps fg/bg.
+            if is_inverse {
                 std::mem::swap(&mut fg, &mut bg);
+            }
+            // Selection paints a subtle tint behind the unchanged text,
+            // instead of inverting — readable, and empty cells highlight
+            // gently rather than becoming solid opposite-color blocks.
+            if is_selected {
+                bg = selection_bg;
             }
 
             match highlight_kind {
@@ -841,20 +869,32 @@ impl<'a> TerminalView<'a> {
 
                 if cursor_point == point && !hide_cursor {
                     let cursor_color = theme.get_color(content.cursor.fg);
-                    shapes.push(Shape::Rect(RectShape::filled(
-                        Rect::from_min_size(
-                            Pos2::new(x, y),
-                            Vec2::new(cell_width, cell_height),
-                        ),
-                        CornerRadius::default(),
-                        cursor_color,
-                    )));
+                    let cursor_rect = Rect::from_min_size(
+                        Pos2::new(x, y),
+                        Vec2::new(cell_width, cell_height),
+                    );
+                    let cursor_shape = if cursor_focused {
+                        // Focused: solid block.
+                        RectShape::filled(cursor_rect, CornerRadius::default(), cursor_color)
+                    } else {
+                        // Unfocused: hollow outline (terminal doesn't have focus).
+                        RectShape::stroke(
+                            cursor_rect,
+                            CornerRadius::default(),
+                            Stroke::new(1.0, cursor_color),
+                            egui::StrokeKind::Inside,
+                        )
+                    };
+                    shapes.push(Shape::Rect(cursor_shape));
                 }
 
                 if cell.c != ' ' && cell.c != '\t' {
+                    // Only invert the glyph under a SOLID (focused) block cursor;
+                    // a hollow unfocused cursor leaves the char legible as-is.
                     if cursor_point == point
                         && is_app_cursor_mode
                         && !hide_cursor
+                        && cursor_focused
                     {
                         std::mem::swap(&mut fg, &mut bg);
                     }
