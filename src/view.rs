@@ -94,6 +94,27 @@ pub struct TerminalViewState {
     last_render_at: Option<std::time::Instant>,
     /// Whether the last render included search highlights (to invalidate cache on change).
     had_highlights: bool,
+    /// Grep/filter mode scroll position: number of *filtered* lines
+    /// scrolled up from the bottom of the filtered list. 0 = follow
+    /// the bottom (sticky for streaming logs). The raw grid's
+    /// `display_offset` is deliberately never touched in filter
+    /// mode, so toggling the filter off restores the exact prior
+    /// raw view. Clamped against the filtered total each render.
+    filter_offset: usize,
+    /// Whether the cached frame was rendered with the filter on.
+    cached_filter_active: bool,
+    /// `filter_offset` of the cached frame — wheel/scrollbar moves
+    /// in filter mode don't set `is_dirty`, so the offset must be
+    /// part of the cache key to repaint on scroll.
+    cached_filter_offset: usize,
+    /// The grid lines (raw `Line.0` values, top to bottom) rendered
+    /// by the last grep/filter frame. Input handling maps pointer
+    /// pixels through this to translate a click on packed screen
+    /// row N into the real grid line it shows, so selection works
+    /// under the remap. Only meaningful while the filter is active
+    /// (one frame behind `filter_rows`, which is fine — it always
+    /// describes what's actually on screen).
+    filter_rows_grid: Vec<i32>,
 }
 
 pub struct TerminalView<'a> {
@@ -133,6 +154,16 @@ pub struct TerminalView<'a> {
     /// active because the widget can't tell whether the matches
     /// it cached are still correct. Defaults to 0 (no search).
     search_key: u64,
+    /// Grep/filter mode: when `Some`, only these raw grid lines
+    /// (`Line.0` values, sorted ascending) are rendered, packed
+    /// consecutively from the top like `grep` output. Typically
+    /// derived from a full-buffer `search_all_in_term` run by the
+    /// embedder; the view merges in a fresh scan of the bottom
+    /// `screen_lines + 5` rows each frame so a streaming tail stays
+    /// current. `Some(vec![])` is valid (query matched nothing →
+    /// blank grid). `None` = normal rendering, byte-identical to
+    /// the pre-filter code path.
+    line_filter: Option<std::sync::Arc<Vec<i32>>>,
 }
 
 impl Widget for TerminalView<'_> {
@@ -189,6 +220,7 @@ impl<'a> TerminalView<'a> {
             grid_columns_override: None,
             horizontal_offset_cols: 0,
             search_key: 0,
+            line_filter: None,
         }
     }
 
@@ -268,6 +300,35 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_current_match(mut self, point: Option<TerminalGridPoint>) -> Self {
         self.current_match_start = point;
+        self
+    }
+
+    /// Grep/filter mode. `Some(lines)` renders only these raw grid
+    /// lines (sorted `Line.0` values), packed consecutively — rows
+    /// not in the list are hidden, like `grep`. The list normally
+    /// comes from the embedder's `search_all_in_term` results
+    /// (every visual row a match touches; continuation rows of a
+    /// wrapped logical line that the match doesn't touch are not
+    /// included). The view keeps the bottom `screen_lines + 5` rows
+    /// fresh itself via `tail_matching_lines` using `search_regex`.
+    /// `Some(vec![])` renders a blank grid; `None` disables the
+    /// filter (normal rendering). Link hover, mouse reports and the
+    /// cursor are suppressed while active; selection works via a
+    /// pointer remap, and the raw grid scroll position is left
+    /// untouched.
+    ///
+    /// Cache contract: the widget's shape cache does NOT hash this
+    /// list — the caller must fold the list's identity (e.g. a
+    /// generation counter bumped on every recompute) into
+    /// `set_search_key`, and must recompute the list after any grid
+    /// reflow (resize or column-override change shifts every line
+    /// index).
+    #[inline]
+    pub fn set_line_filter(
+        mut self,
+        lines: Option<std::sync::Arc<Vec<i32>>>,
+    ) -> Self {
+        self.line_filter = lines;
         self
     }
 
@@ -369,6 +430,11 @@ impl<'a> TerminalView<'a> {
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
+        // Grep/filter mode: the pixel→grid-point mapping is wrong
+        // under the line remap, so selection, mouse reports and
+        // link hover are suppressed, and the wheel scrolls the
+        // filtered window instead of the raw grid.
+        let filter_active = self.line_filter.is_some();
         for event in events {
             let mut input_actions = vec![];
 
@@ -381,16 +447,52 @@ impl<'a> TerminalView<'a> {
                     if !has_focus || self.read_only {
                         continue;
                     }
-                    input_actions.push(process_keyboard_event(
-                        event,
-                        self.backend,
-                        &self.bindings_layout,
-                        modifiers,
-                    ))
+                    // Grep mode: the copy chord must honor the
+                    // filtered rows — the raw selection range spans
+                    // hidden lines the user never saw. Plain ^C
+                    // (no shift) still falls through to the PTY.
+                    let filter_copy = filter_active
+                        && matches!(event, egui::Event::Copy)
+                        && (cfg!(any(target_os = "ios", target_os = "macos"))
+                            || modifiers
+                                .contains(Modifiers::COMMAND | Modifiers::SHIFT));
+                    if filter_copy {
+                        let lines = self
+                            .line_filter
+                            .as_ref()
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        input_actions.push(InputAction::WriteToClipboard(
+                            self.backend.selectable_content_filtered(lines),
+                        ));
+                    } else {
+                        input_actions.push(process_keyboard_event(
+                            event,
+                            self.backend,
+                            &self.bindings_layout,
+                            modifiers,
+                        ))
+                    }
                 },
                 // Mouse wheel: require pointer over widget
                 egui::Event::MouseWheel { unit, delta, .. } => {
                     if !has_pointer {
+                        continue;
+                    }
+                    if filter_active {
+                        // Scroll the filtered window, not the raw
+                        // grid — also keeps ALTERNATE_SCROLL shells
+                        // from receiving arrow-key bytes. Upper
+                        // clamp happens in `show()` where the
+                        // filtered total is known.
+                        let lines = wheel_scroll_lines(
+                            state,
+                            self.font.font_type().size,
+                            unit,
+                            delta,
+                        );
+                        state.filter_offset =
+                            state.filter_offset.saturating_add_signed(lines as isize);
                         continue;
                     }
                     input_actions.push(process_mouse_wheel(
@@ -415,16 +517,54 @@ impl<'a> TerminalView<'a> {
                     if pos.x >= scrollbar_x || state.scrollbar_dragging {
                         continue;
                     }
-                    input_actions.push(process_button_click(
-                        state,
-                        layout,
-                        self.backend,
-                        &self.bindings_layout,
-                        button,
-                        pos,
-                        &modifiers,
-                        pressed,
-                    ))
+                    // Grep mode: drive alacritty's selection with
+                    // explicit grid points mapped through the
+                    // remapped rows. Mouse reports and link opens
+                    // stay disabled (their coordinates are raw-grid
+                    // based and would target hidden rows).
+                    if filter_active {
+                        if button == PointerButton::Primary {
+                            if pressed {
+                                let content = self.backend.last_content();
+                                if let Some((point, side)) = filter_selection_point(
+                                    state,
+                                    layout,
+                                    &content.terminal_size,
+                                    self.horizontal_offset_cols,
+                                    pos,
+                                ) {
+                                    state.is_dragged = true;
+                                    let selection_type = if layout.double_clicked() {
+                                        SelectionType::Semantic
+                                    } else if layout.triple_clicked() {
+                                        SelectionType::Lines
+                                    } else {
+                                        SelectionType::Simple
+                                    };
+                                    input_actions.push(InputAction::BackendCall(
+                                        BackendCommand::SelectStartAtPoint(
+                                            selection_type,
+                                            point,
+                                            side,
+                                        ),
+                                    ));
+                                }
+                            } else {
+                                state.is_dragged = false;
+                            }
+                        }
+                    } else {
+                        input_actions.push(process_button_click(
+                            state,
+                            layout,
+                            self.backend,
+                            &self.bindings_layout,
+                            button,
+                            pos,
+                            &modifiers,
+                            pressed,
+                        ))
+                    }
                 },
                 // Mouse move: require pointer over widget
                 egui::Event::PointerMoved(pos) => {
@@ -434,13 +574,33 @@ impl<'a> TerminalView<'a> {
                     if state.scrollbar_dragging || pos.x >= scrollbar_x {
                         continue;
                     }
-                    input_actions = process_mouse_move(
-                        state,
-                        layout,
-                        self.backend,
-                        pos,
-                        &modifiers,
-                    )
+                    // Grep mode: only selection-drag updates, mapped
+                    // through the remapped rows. Link hover and
+                    // mouse reports stay disabled.
+                    if filter_active {
+                        if state.is_dragged {
+                            let content = self.backend.last_content();
+                            if let Some((point, side)) = filter_selection_point(
+                                state,
+                                layout,
+                                &content.terminal_size,
+                                self.horizontal_offset_cols,
+                                pos,
+                            ) {
+                                input_actions.push(InputAction::BackendCall(
+                                    BackendCommand::SelectUpdateAtPoint(point, side),
+                                ));
+                            }
+                        }
+                    } else {
+                        input_actions = process_mouse_move(
+                            state,
+                            layout,
+                            self.backend,
+                            pos,
+                            &modifiers,
+                        )
+                    }
                 },
                 _ => {},
             };
@@ -501,7 +661,13 @@ impl<'a> TerminalView<'a> {
             && state.cached_visible == Some(key_visible)
             && state.cached_h_offset == self.horizontal_offset_cols
             && state.cached_search_key == self.search_key
-            && state.cached_current_match == self.current_match_start;
+            && state.cached_current_match == self.current_match_start
+            // Filter-mode inputs: wheel/scrollbar moves mutate
+            // `filter_offset` without setting `is_dirty`, so the
+            // offset (and the mode flag itself) must invalidate
+            // the shape cache directly.
+            && state.cached_filter_active == self.line_filter.is_some()
+            && state.cached_filter_offset == state.filter_offset;
 
         // Fast path #1: nothing meaningful has changed since the
         // cached frame — same buffer (`!is_dirty`), same layout,
@@ -568,6 +734,112 @@ impl<'a> TerminalView<'a> {
         );
         let display_offset = content.display_offset;
         let cursor_point = content.cursor_point;
+
+        // Grep/filter mode: build the ordered list of grid lines to
+        // render (the "row map"). `None` leaves the entire render on
+        // the existing identity path. The embedder-supplied list
+        // covers the scrollback (refreshed asynchronously, so it may
+        // be up to ~1 s stale); the bottom `screen_lines + 5` band is
+        // rescanned fresh right here so a streaming tail shows new
+        // matches the same frame they arrive. Stale lines that have
+        // rotated out of the grid are dropped before indexing.
+        let mut filter_rows: Option<Vec<alacritty_terminal::index::Line>> =
+            None;
+        let mut filtered_total: usize = 0;
+        if let Some(ref app_lines) = self.line_filter {
+            // Filter just turned on (previous frame rendered raw):
+            // start at the bottom, following the stream, instead of
+            // resuming a stale offset from an earlier grep session.
+            if !state.cached_filter_active {
+                state.filter_offset = 0;
+            }
+            let topmost = terminal.topmost_line().0;
+            let bottommost = terminal.bottommost_line().0;
+            let screen_lines = terminal.grid().screen_lines();
+            // Fresh-scan band. Steady state: viewport + margin (the
+            // embedder's async list covers everything above). But
+            // right after the embedder replaces the buffer (sort
+            // flip, container switch, stream restart) its list is
+            // empty or too short to fill the screen until an async
+            // scan lands — extend the self-scan so the filtered
+            // view keeps showing real matches instead of blanking
+            // for the gap. Capped by cell count so a huge or very
+            // wide scrollback can't turn this into a per-frame
+            // full-buffer scan.
+            let band = {
+                let base = screen_lines + 5;
+                if app_lines.len() < screen_lines {
+                    let total_rows =
+                        (bottommost - topmost + 1).max(0) as usize;
+                    let columns = terminal.grid().columns().max(1);
+                    const MAX_SELF_SCAN_CELLS: usize = 500_000;
+                    let cap = (MAX_SELF_SCAN_CELLS / columns).max(base);
+                    total_rows.min(cap).max(base)
+                } else {
+                    base
+                }
+            };
+            let (band_start, tail) = match self.search_regex.as_mut() {
+                Some(regex) => (
+                    (bottommost - band.saturating_sub(1) as i32)
+                        .max(topmost),
+                    crate::backend::tail_matching_lines(
+                        &terminal, regex, band,
+                    ),
+                ),
+                // No regex to rescan with — trust the caller's list
+                // for the full range instead of dropping the band.
+                None => (bottommost + 1, Vec::new()),
+            };
+            let merged = merge_filter_lines(
+                app_lines, &tail, topmost, band_start,
+            );
+
+            // The user navigated (F3 / Enter / etc.) — bring the
+            // target match's line into the filtered window. Must be
+            // detected *before* the highlight code below updates
+            // `last_caller_current`.
+            if self.current_match_start != state.last_caller_current {
+                if let Some(target) = self.current_match_start {
+                    if let Some(idx) = filter_line_index(
+                        &merged,
+                        target.line.0,
+                    ) {
+                        state.filter_offset = nav_offset_for(
+                            merged.len(),
+                            idx,
+                            screen_lines,
+                            state.filter_offset,
+                        );
+                    }
+                }
+            }
+
+            filtered_total = merged.len();
+            state.filter_offset = state
+                .filter_offset
+                .min(filtered_total.saturating_sub(screen_lines));
+            let (win_start, win_end) = filter_window(
+                filtered_total,
+                screen_lines,
+                state.filter_offset,
+            );
+            state.filter_rows_grid = merged[win_start..win_end].to_vec();
+            filter_rows = Some(
+                state
+                    .filter_rows_grid
+                    .iter()
+                    .map(|l| alacritty_terminal::index::Line(*l))
+                    .collect(),
+            );
+        }
+        // The offset this frame's shapes are actually built with.
+        // The scrollbar below may mutate `state.filter_offset`
+        // after the shapes exist; stamping the *rendered* value
+        // into the cache key makes the next frame miss the cache
+        // and repaint at the new position instead of freezing on
+        // the pre-drag frame.
+        let rendered_filter_offset = state.filter_offset;
 
         // Compute visible search matches once. Match ranges are
         // expanded into a BTreeSet of grid points so the per-cell
@@ -657,10 +929,18 @@ impl<'a> TerminalView<'a> {
             let scan_min = visible_min_col.max(0) as usize;
             let scan_max =
                 visible_max_col.max(visible_min_col) as usize;
-            let bounded =
+            // In filter mode, scan exactly the remapped rows being
+            // displayed — the viewport-range scan would highlight
+            // lines that aren't rendered and miss ones that are.
+            let bounded = if let Some(ref rows) = filter_rows {
+                crate::backend::regex_matches_on_lines(
+                    &terminal, regex, rows, scan_min, scan_max,
+                )
+            } else {
                 crate::backend::visible_regex_match_iter_in_cols(
                     &terminal, regex, scan_min, scan_max, 5,
-                );
+                )
+            };
             for m in bounded {
                 let m_start_col = m.start().column.0 as i32;
                 let m_end_col = m.end().column.0 as i32;
@@ -756,7 +1036,9 @@ impl<'a> TerminalView<'a> {
         let col_end_idx = col_end_idx.min(total_columns);
         let is_app_cursor_mode = content.terminal_mode.contains(TermMode::APP_CURSOR);
         let font_type = self.font.font_type();
-        let hide_cursor = self.hide_cursor;
+        // Filter mode always hides the cursor — its grid position
+        // has no meaningful screen row under the remap.
+        let hide_cursor = self.hide_cursor || filter_rows.is_some();
         // Focused → solid block cursor; unfocused (e.g. the search box has focus)
         // → hollow outline, so it's visually clear keystrokes go elsewhere.
         let cursor_focused = layout.has_focus();
@@ -764,8 +1046,20 @@ impl<'a> TerminalView<'a> {
         let mouse_pos = state.current_mouse_position_on_grid;
         painter.fonts_mut(|fonts| {
         for line_idx in 0..screen_lines_i32 {
-            let viewport_line =
-                alacritty_terminal::index::Line(line_idx - display_offset_i32);
+            // Identity path (`None`): screen row N shows grid line
+            // `N - display_offset`, exactly as before. Filter mode:
+            // screen row N shows the Nth line of the remapped
+            // window; when the window has fewer lines than the
+            // screen, the remaining rows stay background-only.
+            let viewport_line = match filter_rows {
+                None => alacritty_terminal::index::Line(
+                    line_idx - display_offset_i32,
+                ),
+                Some(ref rows) => match rows.get(line_idx as usize) {
+                    Some(l) => *l,
+                    None => break,
+                },
+            };
             for col_idx in col_start_idx..col_end_idx {
                 let column = alacritty_terminal::index::Column(col_idx);
                 let point = alacritty_terminal::index::Point::new(
@@ -807,7 +1101,14 @@ impl<'a> TerminalView<'a> {
                 let col = col_idx as i32;
                 let x = layout_min.x
                     + (cell_width * (col - h_offset_cols) as f32);
-                let line_num = viewport_line.0 + display_offset as i32;
+                // Identity path: paint row equals screen row (the
+                // expression is kept verbatim; it equals `line_idx`).
+                // Filter mode: pack remapped lines consecutively.
+                let line_num = if filter_rows.is_none() {
+                    viewport_line.0 + display_offset as i32
+                } else {
+                    line_idx
+                };
                 let y = layout_min.y + (cell_height * line_num as f32);
 
                 let mut fg = theme.get_color(cell.fg);
@@ -926,6 +1227,21 @@ impl<'a> TerminalView<'a> {
             let border_color = egui::Color32::from_rgb(255, 180, 50);
             let stroke = Stroke::new(2.0, border_color);
 
+            // Screen paint row for a grid line. Identity path keeps
+            // the original `line + display_offset` formula; filter
+            // mode looks the line up in the remapped window (`None`
+            // → the line isn't displayed, skip that border segment).
+            let row_for_line =
+                |l: alacritty_terminal::index::Line| -> Option<i32> {
+                    match filter_rows {
+                        None => Some(l.0 + display_offset as i32),
+                        Some(ref rows) => rows
+                            .binary_search(&l)
+                            .ok()
+                            .map(|i| i as i32),
+                    }
+                };
+
             if start.line == end.line {
                 // Single-line match: one border rect
                 let x1 = layout_min.x
@@ -933,18 +1249,22 @@ impl<'a> TerminalView<'a> {
                 let x2 = layout_min.x
                     + (cell_width
                         * (end.column.0 as i32 + 1 - h_offset_cols) as f32);
-                let line_num = start.line.0 + display_offset as i32;
-                let y = layout_min.y + (cell_height * line_num as f32);
-                let rect = Rect::from_min_size(
-                    Pos2::new(x1, y),
-                    Vec2::new(x2 - x1, cell_height),
-                );
-                shapes.push(Shape::Rect(RectShape::new(rect, CornerRadius::same(2), egui::Color32::TRANSPARENT, stroke, egui::StrokeKind::Outside)));
+                if let Some(line_num) = row_for_line(start.line) {
+                    let y = layout_min.y + (cell_height * line_num as f32);
+                    let rect = Rect::from_min_size(
+                        Pos2::new(x1, y),
+                        Vec2::new(x2 - x1, cell_height),
+                    );
+                    shapes.push(Shape::Rect(RectShape::new(rect, CornerRadius::same(2), egui::Color32::TRANSPARENT, stroke, egui::StrokeKind::Outside)));
+                }
             } else {
                 // Multi-line match: border per line
                 let mut line = start.line;
                 while line <= end.line {
-                    let line_num = line.0 + display_offset as i32;
+                    let Some(line_num) = row_for_line(line) else {
+                        line += 1;
+                        continue;
+                    };
                     let y = layout_min.y + (cell_height * line_num as f32);
                     let col_start = if line == start.line { start.column.0 } else { 0 };
                     let col_end = if line == end.line { end.column.0 + 1 } else { cols };
@@ -962,12 +1282,16 @@ impl<'a> TerminalView<'a> {
             }
         }
 
-        // Scrollbar
+        // Scrollbar. Grep/filter mode gets its own branch below —
+        // it counts *filtered* lines and moves `filter_offset`
+        // instead of the raw grid's display offset. The raw branch
+        // is the pre-filter code, untouched.
+        let filter_scrollbar = filter_rows.is_some();
         let total_lines = terminal.grid().total_lines();
         let screen_lines = terminal.grid().screen_lines();
         let history_size = total_lines.saturating_sub(screen_lines);
 
-        if history_size > 0 {
+        if !filter_scrollbar && history_size > 0 {
             let scrollbar_width = 8.0_f32;
             // Pin to the visible viewport's right edge — that's
             // where the user can actually see and click. The track's
@@ -1075,6 +1399,99 @@ impl<'a> TerminalView<'a> {
                 CornerRadius::same(4),
                 thumb_color,
             )));
+        } else if filter_scrollbar
+            && filtered_total > screen_lines
+        {
+            // Grep/filter scrollbar: same geometry as the raw
+            // branch, but total = filtered lines and click/drag
+            // move `filter_offset` — never the raw grid. Shapes
+            // for this frame were already built with the offset
+            // captured in `rendered_filter_offset`; mutations here
+            // take effect next frame via the cache-key mismatch.
+            let max_off = filtered_total - screen_lines;
+            let scrollbar_width = 8.0_f32;
+            let track_rect = Rect::from_min_max(
+                Pos2::new(visible_rect.max.x - scrollbar_width, visible_rect.min.y),
+                Pos2::new(visible_rect.max.x, visible_rect.max.y),
+            );
+            let track_height = track_rect.height();
+            let thumb_frac = screen_lines as f32 / filtered_total as f32;
+            let thumb_height = (thumb_frac * track_height).max(20.0);
+            let scrollable_track = track_height - thumb_height;
+
+            // filter_offset=0 → thumb at bottom, =max_off → at top
+            let ratio = state.filter_offset as f32 / max_off as f32;
+            let thumb_top =
+                track_rect.min.y + (1.0 - ratio) * scrollable_track;
+            let thumb_rect = Rect::from_min_size(
+                Pos2::new(track_rect.min.x, thumb_top),
+                Vec2::new(scrollbar_width, thumb_height),
+            );
+
+            let (pointer_pos, primary_down, primary_pressed) =
+                layout.ctx.input(|i| {
+                    (
+                        i.pointer.hover_pos(),
+                        i.pointer.primary_down(),
+                        i.pointer.primary_pressed(),
+                    )
+                });
+
+            if let Some(pos) = pointer_pos {
+                if primary_pressed && track_rect.contains(pos) {
+                    if thumb_rect.contains(pos) {
+                        state.scrollbar_dragging = true;
+                        state.scrollbar_grab_offset = pos.y - thumb_top;
+                    } else {
+                        let page = screen_lines.saturating_sub(1).max(1);
+                        if pos.y < thumb_rect.min.y {
+                            state.filter_offset = state
+                                .filter_offset
+                                .saturating_add(page)
+                                .min(max_off);
+                        } else {
+                            state.filter_offset =
+                                state.filter_offset.saturating_sub(page);
+                        }
+                    }
+                }
+
+                if state.scrollbar_dragging && primary_down {
+                    let desired_thumb_top =
+                        pos.y - state.scrollbar_grab_offset;
+                    let ratio = if scrollable_track > 0.0 {
+                        1.0 - ((desired_thumb_top - track_rect.min.y)
+                            / scrollable_track)
+                            .clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    state.filter_offset =
+                        (ratio * max_off as f32).round() as usize;
+                }
+            }
+            if !primary_down {
+                state.scrollbar_dragging = false;
+            }
+
+            let sb_fg = self.theme
+                .get_color(Color::Named(NamedColor::Foreground));
+            let track_color = egui::Color32::from_rgba_unmultiplied(
+                sb_fg.r(), sb_fg.g(), sb_fg.b(), 24,
+            );
+            let thumb_color = egui::Color32::from_rgba_unmultiplied(
+                sb_fg.r(), sb_fg.g(), sb_fg.b(), 110,
+            );
+            shapes.push(Shape::Rect(RectShape::filled(
+                track_rect,
+                CornerRadius::same(4),
+                track_color,
+            )));
+            shapes.push(Shape::Rect(RectShape::filled(
+                thumb_rect,
+                CornerRadius::same(4),
+                thumb_color,
+            )));
         } else {
             state.scrollbar_dragging = false;
         }
@@ -1091,10 +1508,73 @@ impl<'a> TerminalView<'a> {
         state.cached_h_offset = self.horizontal_offset_cols;
         state.cached_search_key = self.search_key;
         state.cached_current_match = self.current_match_start;
+        state.cached_filter_active = self.line_filter.is_some();
+        state.cached_filter_offset = rendered_filter_offset;
         state.last_render_at = Some(std::time::Instant::now());
         state.had_highlights = has_any_highlights;
         painter.extend(shapes);
     }
+}
+
+/// Merge the embedder-supplied filtered-line list with the fresh
+/// tail scan. `app` covers the scrollback but may be stale, so it
+/// only contributes lines above the tail band (`< band_start`) and
+/// within grid bounds (`>= topmost`); `tail` is authoritative for
+/// the band itself. Both inputs are sorted ascending and the band
+/// split keeps the result sorted with no duplicates.
+fn merge_filter_lines(
+    app: &[i32],
+    tail: &[i32],
+    topmost: i32,
+    band_start: i32,
+) -> Vec<i32> {
+    app.iter()
+        .copied()
+        .filter(|l| *l >= topmost && *l < band_start)
+        .chain(tail.iter().copied())
+        .collect()
+}
+
+/// The `[start, end)` slice of a filtered-line list that is visible
+/// with `offset` lines scrolled up from the bottom. Clamps the
+/// offset so the window never runs past the top of the list.
+fn filter_window(
+    total: usize,
+    screen: usize,
+    offset: usize,
+) -> (usize, usize) {
+    let max_off = total.saturating_sub(screen);
+    let offset = offset.min(max_off);
+    let end = total - offset;
+    let start = end.saturating_sub(screen);
+    (start, end)
+}
+
+/// Index of `line` in a sorted filtered-line list, if present.
+fn filter_line_index(lines: &[i32], line: i32) -> Option<usize> {
+    lines.binary_search(&line).ok()
+}
+
+/// Scroll offset that brings list index `idx` into the filtered
+/// window. Keeps the current offset when the index is already
+/// visible; otherwise places the target roughly a third of the way
+/// down the window (mirrors how F3 navigation re-centers the raw
+/// grid).
+fn nav_offset_for(
+    total: usize,
+    idx: usize,
+    screen: usize,
+    cur_offset: usize,
+) -> usize {
+    let max_off = total.saturating_sub(screen);
+    let cur = cur_offset.min(max_off);
+    let (start, end) = filter_window(total, screen, cur);
+    if idx >= start && idx < end {
+        return cur;
+    }
+    let desired_start = idx.saturating_sub(screen / 3);
+    let desired_end = desired_start + screen;
+    total.saturating_sub(desired_end).min(max_off)
 }
 
 /// Round a `Rect` to integer pixels. Used as a cache key so
@@ -1335,28 +1815,101 @@ fn process_keyboard_key(
     }
 }
 
+/// Map a pointer position to the raw grid point it touches under
+/// the grep/filter remap, plus the cell side (for selection). Uses
+/// the row list rendered by the last filter frame; returns `None`
+/// when nothing is displayed (no matches yet) or geometry is
+/// degenerate.
+fn filter_selection_point(
+    state: &TerminalViewState,
+    layout: &Response,
+    term_size: &crate::backend::TerminalSize,
+    h_offset_cols: usize,
+    position: Pos2,
+) -> Option<(TerminalGridPoint, alacritty_terminal::index::Side)> {
+    let (line, col, right_side) = filter_selection_target(
+        &state.filter_rows_grid,
+        position.x - layout.rect.min.x,
+        position.y - layout.rect.min.y,
+        term_size.cell_width as f32,
+        term_size.cell_height as f32,
+        term_size.columns(),
+        h_offset_cols,
+    )?;
+    let side = if right_side {
+        alacritty_terminal::index::Side::Right
+    } else {
+        alacritty_terminal::index::Side::Left
+    };
+    Some((
+        TerminalGridPoint::new(
+            alacritty_terminal::index::Line(line),
+            alacritty_terminal::index::Column(col),
+        ),
+        side,
+    ))
+}
+
+/// Pure pixel→(grid line, column, right-side) math for
+/// `filter_selection_point`. `rows` is the remapped window (grid
+/// lines top to bottom), `x`/`y` are relative to the widget origin,
+/// and `h_offset_cols` is the wrap-off horizontal pan (screen
+/// column 0 shows grid column `h_offset_cols`).
+fn filter_selection_target(
+    rows: &[i32],
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    columns: usize,
+    h_offset_cols: usize,
+) -> Option<(i32, usize, bool)> {
+    if rows.is_empty() || cell_width <= 0.0 || cell_height <= 0.0 || columns == 0 {
+        return None;
+    }
+    let x = x.max(0.0);
+    let y = y.max(0.0);
+    let row = ((y / cell_height) as usize).min(rows.len() - 1);
+    let col = ((x / cell_width) as usize + h_offset_cols).min(columns - 1);
+    let right_side = x % cell_width > cell_width / 2.0;
+    Some((rows[row], col, right_side))
+}
+
+/// Convert a wheel event into scroll lines (positive = scroll up),
+/// accumulating sub-line pixel deltas in `state.scroll_pixels`.
+/// Shared by the raw-grid path (`process_mouse_wheel`) and the
+/// grep/filter path (which moves `filter_offset` instead).
+fn wheel_scroll_lines(
+    state: &mut TerminalViewState,
+    font_size: f32,
+    unit: MouseWheelUnit,
+    delta: Vec2,
+) -> i32 {
+    match unit {
+        MouseWheelUnit::Line => {
+            (delta.y.signum() * delta.y.abs().ceil()) as i32
+        },
+        MouseWheelUnit::Point => {
+            state.scroll_pixels -= delta.y;
+            let lines = (state.scroll_pixels / font_size).trunc();
+            state.scroll_pixels %= font_size;
+            -lines as i32
+        },
+        MouseWheelUnit::Page => 0,
+    }
+}
+
 fn process_mouse_wheel(
     state: &mut TerminalViewState,
     font_size: f32,
     unit: MouseWheelUnit,
     delta: Vec2,
 ) -> InputAction {
-    match unit {
-        MouseWheelUnit::Line => {
-            let lines = delta.y.signum() * delta.y.abs().ceil();
-            InputAction::BackendCall(BackendCommand::Scroll(lines as i32))
-        },
-        MouseWheelUnit::Point => {
-            state.scroll_pixels -= delta.y;
-            let lines = (state.scroll_pixels / font_size).trunc();
-            state.scroll_pixels %= font_size;
-            if lines != 0.0 {
-                InputAction::BackendCall(BackendCommand::Scroll(-lines as i32))
-            } else {
-                InputAction::Ignore
-            }
-        },
-        MouseWheelUnit::Page => InputAction::Ignore,
+    let lines = wheel_scroll_lines(state, font_size, unit, delta);
+    if lines != 0 {
+        InputAction::BackendCall(BackendCommand::Scroll(lines))
+    } else {
+        InputAction::Ignore
     }
 }
 
@@ -1531,4 +2084,146 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::{
+        filter_line_index, filter_selection_target, filter_window,
+        merge_filter_lines, nav_offset_for,
+    };
+
+    #[test]
+    fn merge_keeps_app_above_band_and_tail_inside() {
+        // app has stale entries inside the band (5, 9) that the
+        // fresh tail (band_start = 5) supersedes.
+        let app = vec![-10, -3, 0, 5, 9];
+        let tail = vec![6, 8];
+        assert_eq!(
+            merge_filter_lines(&app, &tail, -100, 5),
+            vec![-10, -3, 0, 6, 8]
+        );
+    }
+
+    #[test]
+    fn merge_drops_lines_rotated_out_of_the_grid() {
+        let app = vec![-500, -200, -50, 0];
+        assert_eq!(
+            merge_filter_lines(&app, &[], -100, 10),
+            vec![-50, 0]
+        );
+    }
+
+    #[test]
+    fn merge_empty_inputs() {
+        assert_eq!(merge_filter_lines(&[], &[], -100, 5), Vec::<i32>::new());
+        assert_eq!(merge_filter_lines(&[], &[1, 2], -100, 0), vec![1, 2]);
+    }
+
+    #[test]
+    fn window_at_bottom() {
+        assert_eq!(filter_window(100, 40, 0), (60, 100));
+    }
+
+    #[test]
+    fn window_scrolled_up_and_clamped() {
+        assert_eq!(filter_window(100, 40, 30), (30, 70));
+        // offset past the top clamps to the topmost window
+        assert_eq!(filter_window(100, 40, 500), (0, 40));
+    }
+
+    #[test]
+    fn window_shorter_than_screen() {
+        assert_eq!(filter_window(10, 40, 0), (0, 10));
+        assert_eq!(filter_window(10, 40, 7), (0, 10));
+        assert_eq!(filter_window(0, 40, 0), (0, 0));
+    }
+
+    #[test]
+    fn line_index_lookup() {
+        let lines = vec![-5, 0, 3, 42];
+        assert_eq!(filter_line_index(&lines, 3), Some(2));
+        assert_eq!(filter_line_index(&lines, 4), None);
+        assert_eq!(filter_line_index(&[], 4), None);
+    }
+
+    #[test]
+    fn nav_keeps_offset_when_target_visible() {
+        // window at offset 10 of total 100, screen 40 → [50, 90)
+        assert_eq!(nav_offset_for(100, 60, 40, 10), 10);
+    }
+
+    #[test]
+    fn nav_scrolls_to_target_above_window() {
+        // target index 5 with screen 40 → desired_start 0 (5 - 13
+        // saturates towards the top), offset near max
+        let off = nav_offset_for(100, 5, 40, 0);
+        let (start, end) = filter_window(100, 40, off);
+        assert!((start..end).contains(&5));
+    }
+
+    #[test]
+    fn nav_scrolls_to_target_below_window() {
+        // window at offset 50 → [10, 50); target 95 is below
+        let off = nav_offset_for(100, 95, 40, 50);
+        let (start, end) = filter_window(100, 40, off);
+        assert!((start..end).contains(&95));
+    }
+
+    #[test]
+    fn nav_short_list_stays_at_zero() {
+        assert_eq!(nav_offset_for(10, 3, 40, 0), 0);
+        assert_eq!(nav_offset_for(10, 3, 40, 99), 0);
+    }
+
+    #[test]
+    fn selection_target_maps_screen_row_to_grid_line() {
+        let rows = vec![-40, -12, 3, 7];
+        // y in row 2 (cell_height 10), x in col 4 (cell_width 8)
+        let (line, col, right) =
+            filter_selection_target(&rows, 33.0, 25.0, 8.0, 10.0, 80, 0)
+                .unwrap();
+        assert_eq!(line, 3);
+        assert_eq!(col, 4);
+        assert!(!right); // 33 % 8 = 1 → left half
+    }
+
+    #[test]
+    fn selection_target_clamps_below_last_row_and_right_edge() {
+        let rows = vec![0, 5];
+        let (line, col, _) =
+            filter_selection_target(&rows, 9999.0, 9999.0, 8.0, 10.0, 80, 0)
+                .unwrap();
+        assert_eq!(line, 5);
+        assert_eq!(col, 79);
+    }
+
+    #[test]
+    fn selection_target_applies_horizontal_offset() {
+        let rows = vec![2];
+        let (_, col, _) =
+            filter_selection_target(&rows, 16.0, 0.0, 8.0, 10.0, 500, 100)
+                .unwrap();
+        assert_eq!(col, 102);
+    }
+
+    #[test]
+    fn selection_target_right_side_past_half_cell() {
+        let rows = vec![0];
+        let (_, col, right) =
+            filter_selection_target(&rows, 7.0, 0.0, 8.0, 10.0, 80, 0)
+                .unwrap();
+        assert_eq!(col, 0);
+        assert!(right); // 7 > 4 → right half
+    }
+
+    #[test]
+    fn selection_target_rejects_empty_or_degenerate() {
+        assert!(filter_selection_target(&[], 5.0, 5.0, 8.0, 10.0, 80, 0)
+            .is_none());
+        assert!(filter_selection_target(&[1], 5.0, 5.0, 0.0, 10.0, 80, 0)
+            .is_none());
+        assert!(filter_selection_target(&[1], 5.0, 5.0, 8.0, 10.0, 0, 0)
+            .is_none());
+    }
 }

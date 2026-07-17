@@ -8,7 +8,8 @@ mod view;
 
 pub use backend::settings::BackendSettings;
 pub use backend::{
-    search_all_in_term, visible_regex_match_iter_in_cols, BackendCommand,
+    regex_matches_on_lines, search_all_in_term, search_all_in_term_chunked,
+    tail_matching_lines, visible_regex_match_iter_in_cols, BackendCommand,
     DirectHandle, DirectWriter, GridBounds, PtyEvent, StreamHandle,
     TerminalBackend, TerminalMode,
 };
