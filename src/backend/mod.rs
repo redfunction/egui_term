@@ -229,6 +229,14 @@ pub struct TerminalBackend {
     content_revision: Arc<AtomicU64>,
     /// Shared flag for sticky-scroll (log mode): keep view stable as new content arrives.
     sticky_scroll: Option<Arc<AtomicBool>>,
+    /// The size the program inside the PTY has been told about.
+    /// Normally the same as `size`; it falls behind while an
+    /// embedder holds the PTY through a resize drag
+    /// (`hold_pty_size`), and catches up when the hold is released.
+    pty_size: WindowSize,
+    /// While set, `resize` reflows the grid but does not tell the
+    /// PTY.
+    pty_hold: bool,
 }
 
 impl TerminalBackend {
@@ -313,6 +321,8 @@ impl TerminalBackend {
             dirty,
             content_revision: Arc::new(AtomicU64::new(0)),
             sticky_scroll: None,
+            pty_size: terminal_size.into(),
+            pty_hold: false,
         })
     }
 
@@ -386,6 +396,8 @@ impl TerminalBackend {
                 dirty,
                 content_revision: Arc::new(AtomicU64::new(0)),
                 sticky_scroll: None,
+                pty_size: terminal_size.into(),
+                pty_hold: false,
                 },
             handle,
         ))
@@ -477,6 +489,8 @@ impl TerminalBackend {
                 dirty,
                 content_revision,
                 sticky_scroll: Some(sticky_scroll),
+                pty_size: terminal_size.into(),
+                pty_hold: false,
             },
             handle,
         ))
@@ -857,6 +871,46 @@ impl TerminalBackend {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Hold the PTY at the size the program already knows, while the
+    /// DISPLAY keeps following the widget.
+    ///
+    /// Resizing the grid resizes the PTY, and that sends the program
+    /// inside it a SIGWINCH. A CLI that draws its UI in the primary
+    /// buffer — an agent, a pager, anything that repaints in place
+    /// rather than on the alternate screen — answers each one by
+    /// rewinding the cursor and reprinting its box. The rewind is
+    /// computed for the width it printed at, so once the grid has
+    /// reflowed it lands in the wrong place and the old copy stays on
+    /// screen. An embedder dragging a splitter crosses a column
+    /// boundary every few pixels and sends dozens of them; the
+    /// transcript fills with duplicated paragraphs, each a little
+    /// narrower than the last.
+    ///
+    /// So the two are separable. While held, `resize` still reflows
+    /// the alacritty grid — the view follows the drag in real time,
+    /// with no gap and nothing clipped — but the program is not told.
+    /// Releasing the hold sends the size it ended on, once. The
+    /// program's idea of the width is stale for the length of the
+    /// drag, which costs at most some mis-wrapped output it writes in
+    /// that window; alacritty wraps it correctly either way.
+    ///
+    /// Idempotent: holding while held, or releasing while free, does
+    /// nothing.
+    pub fn hold_pty_size(&mut self, hold: bool) {
+        if self.pty_hold == hold {
+            return;
+        }
+        self.pty_hold = hold;
+        if !hold {
+            self.sync_pty_size();
+        }
+    }
+
+    /// Whether a `hold_pty_size(true)` is currently in force.
+    pub fn pty_size_held(&self) -> bool {
+        self.pty_hold
+    }
+
     /// Enable sticky-scroll mode (log mode): when the user scrolls up,
     /// new content won't auto-scroll the view down.
     pub fn set_sticky_scroll(&self, enabled: bool) {
@@ -870,6 +924,15 @@ impl TerminalBackend {
         let mut terminal = self.term.lock();
         terminal.grid_mut().scroll_display(Scroll::Top);
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// How many lines the view is scrolled up from the bottom.
+    ///
+    /// Read straight from the grid rather than from `last_content`,
+    /// which only moves when the renderer syncs — and the renderer
+    /// needs this value to decide whether it may skip that sync.
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
     }
 
     /// Check if the terminal is scrolled to the bottom.
@@ -1205,12 +1268,34 @@ impl TerminalBackend {
             self.size.num_lines = new_lines;
             self.size.num_cols = new_cols;
             self.dirty.store(true, Ordering::Release);
-            self.sink.on_resize(self.size.into());
+            // The GRID always follows, so the view reflows in real
+            // time while the user drags. Telling the program inside
+            // is a separate thing, and an embedder may be holding it
+            // — see `hold_pty_size`.
             terminal.resize(TermSize::new(
                 new_cols as usize,
                 new_lines as usize,
             ));
+            self.sync_pty_size();
         }
+    }
+
+    /// Tell the program inside the PTY the size the grid is at,
+    /// unless a hold is in force or it already knows.
+    fn sync_pty_size(&mut self) {
+        if self.pty_hold {
+            return;
+        }
+        let want: WindowSize = self.size.into();
+        if want.num_cols == self.pty_size.num_cols
+            && want.num_lines == self.pty_size.num_lines
+            && want.cell_width == self.pty_size.cell_width
+            && want.cell_height == self.pty_size.cell_height
+        {
+            return;
+        }
+        self.pty_size = want;
+        self.sink.on_resize(want);
     }
 
     fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
@@ -1880,5 +1965,99 @@ mod chunked_scan_tests {
                 polls > 2
             });
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a headless backend (no PTY, no GPU) plus the channel the
+    /// PTY resizes would go down.
+    fn headless() -> (TerminalBackend, DirectHandle) {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel::<(u64, PtyEvent)>();
+        TerminalBackend::new_direct(1, ctx, tx)
+            .expect("headless backend")
+    }
+
+    fn resize(backend: &mut TerminalBackend, w: f32, h: f32) {
+        backend.process_command(BackendCommand::Resize(
+            Size { width: w, height: h },
+            Size { width: 10.0, height: 20.0 },
+        ));
+    }
+
+    #[test]
+    fn resize_tells_the_pty_when_nothing_is_held() {
+        let (mut backend, handle) = headless();
+        resize(&mut backend, 500.0, 400.0);
+        let got = handle.resize_rx.try_recv().expect("a winsize");
+        assert_eq!(got.num_cols, 50);
+        assert_eq!(got.num_lines, 20);
+    }
+
+    #[test]
+    fn a_held_pty_is_not_told_but_the_grid_still_reflows() {
+        let (mut backend, handle) = headless();
+        backend.hold_pty_size(true);
+        resize(&mut backend, 300.0, 400.0);
+        assert!(
+            handle.resize_rx.try_recv().is_err(),
+            "the program must not see a SIGWINCH mid-drag"
+        );
+        // The grid itself followed, which is what keeps the view
+        // filling the panel with nothing clipped.
+        assert_eq!(backend.size.num_cols, 30);
+        assert_eq!(
+            backend.term().lock().columns(),
+            30,
+            "the alacritty grid must reflow under the drag"
+        );
+    }
+
+    #[test]
+    fn a_whole_drag_costs_one_winsize() {
+        let (mut backend, handle) = headless();
+        backend.hold_pty_size(true);
+        for w in [480.0, 460.0, 440.0, 420.0, 400.0, 380.0, 360.0] {
+            resize(&mut backend, w, 400.0);
+        }
+        assert!(handle.resize_rx.try_recv().is_err());
+        backend.hold_pty_size(false);
+        let got = handle.resize_rx.try_recv().expect("the size it landed on");
+        assert_eq!(got.num_cols, 36);
+        assert!(
+            handle.resize_rx.try_recv().is_err(),
+            "one winsize for the drag, not one per column"
+        );
+    }
+
+    #[test]
+    fn releasing_a_hold_that_changed_nothing_is_silent() {
+        let (mut backend, handle) = headless();
+        resize(&mut backend, 500.0, 400.0);
+        handle.resize_rx.try_recv().expect("the initial size");
+        backend.hold_pty_size(true);
+        backend.hold_pty_size(false);
+        assert!(
+            handle.resize_rx.try_recv().is_err(),
+            "the program already knows this size"
+        );
+    }
+
+    #[test]
+    fn holding_is_idempotent_and_reported() {
+        let (mut backend, handle) = headless();
+        assert!(!backend.pty_size_held());
+        backend.hold_pty_size(true);
+        backend.hold_pty_size(true);
+        assert!(backend.pty_size_held());
+        resize(&mut backend, 300.0, 400.0);
+        backend.hold_pty_size(false);
+        backend.hold_pty_size(false);
+        assert!(!backend.pty_size_held());
+        handle.resize_rx.try_recv().expect("one winsize");
+        assert!(handle.resize_rx.try_recv().is_err());
     }
 }

@@ -107,6 +107,18 @@ pub struct TerminalViewState {
     /// in filter mode don't set `is_dirty`, so the offset must be
     /// part of the cache key to repaint on scroll.
     cached_filter_offset: usize,
+    /// Scroll position of the cached frame.
+    ///
+    /// Scrolling sets `is_dirty` like any other change, which put it
+    /// behind the 33ms rebuild throttle below — a throttle meant for
+    /// streaming logs, where the dirty bit is set on every batch
+    /// flush. A wheel spins faster than 30fps, so the view advanced
+    /// in uneven two- and four-line jumps instead of a step per
+    /// notch. Measured off a 60fps capture: 39 visual updates for 60
+    /// notches. Making the offset part of the cache key takes a
+    /// scroll off that throttle — it is a new frame, not a redraw of
+    /// the same one.
+    cached_display_offset: usize,
     /// The grid lines (raw `Line.0` values, top to bottom) rendered
     /// by the last grep/filter frame. Input handling maps pointer
     /// pixels through this to translate a click on packed screen
@@ -479,28 +491,15 @@ impl<'a> TerminalView<'a> {
                     if !has_pointer {
                         continue;
                     }
-                    if filter_active {
-                        // Scroll the filtered window, not the raw
-                        // grid — also keeps ALTERNATE_SCROLL shells
-                        // from receiving arrow-key bytes. Upper
-                        // clamp happens in `show()` where the
-                        // filtered total is known.
-                        let lines = wheel_scroll_lines(
-                            state,
-                            self.font.font_type().size,
-                            unit,
-                            delta,
-                        );
-                        state.filter_offset =
-                            state.filter_offset.saturating_add_signed(lines as isize);
-                        continue;
-                    }
-                    input_actions.push(process_mouse_wheel(
+                    // Bank the distance; the frame loop below spends it.
+                    // Nothing is emitted here, so several events landing in
+                    // one frame cannot stack into a single jump.
+                    bank_wheel_pixels(
                         state,
                         self.font.font_type().size,
                         unit,
                         delta,
-                    ))
+                    );
                 },
                 // Mouse button: require pointer over widget (or dragging for release)
                 egui::Event::PointerButton {
@@ -618,6 +617,30 @@ impl<'a> TerminalView<'a> {
             }
         }
 
+        // Spend the bank, a few rows per FRAME rather than all of a notch at
+        // once, and keep the frames coming until it is empty. A grid can only
+        // move by whole rows, so a notch used to land as one jump; next to a
+        // browser, which animates the same distance across many pixel steps,
+        // that reads as stepping rather than scrolling.
+        let cell = self.font.font_type().size;
+        if state.scroll_pixels.abs() >= cell {
+            let lines = drain_banked_scroll(state, cell);
+            if lines != 0 {
+                if self.line_filter.is_some() {
+                    state.filter_offset =
+                        state.filter_offset.saturating_add_signed(lines as isize);
+                } else {
+                    self.backend
+                        .process_command(BackendCommand::Scroll(lines));
+                }
+            }
+            layout.ctx.request_repaint();
+        } else if state.scroll_pixels != 0.0 {
+            // Less than a row left over: keep it for the next notch rather
+            // than rounding it away, so slow trackpad travel still adds up.
+            state.scroll_pixels %= cell.max(1.0);
+        }
+
         self
     }
 
@@ -655,6 +678,10 @@ impl<'a> TerminalView<'a> {
         // some layouts; an exact `Rect == Rect` comparison would
         // miss the cache forever and force a full render per
         // frame in no-wrap mode.
+        // Read from the grid, not from `last_content`: that only moves
+        // when we sync, and the whole point is to decide whether we
+        // may skip the sync.
+        let display_offset = self.backend.display_offset();
         let key_layout = round_rect_int(layout.rect);
         let key_visible = round_rect_int(*visible_rect);
         let cache_key_matches = state.cached_rect == Some(key_layout)
@@ -667,7 +694,10 @@ impl<'a> TerminalView<'a> {
             // offset (and the mode flag itself) must invalidate
             // the shape cache directly.
             && state.cached_filter_active == self.line_filter.is_some()
-            && state.cached_filter_offset == state.filter_offset;
+            && state.cached_filter_offset == state.filter_offset
+            // A scroll is a different frame, not a stale one: it must
+            // miss BOTH fast paths, the throttle included.
+            && state.cached_display_offset == display_offset;
 
         // Fast path #1: nothing meaningful has changed since the
         // cached frame — same buffer (`!is_dirty`), same layout,
@@ -694,8 +724,13 @@ impl<'a> TerminalView<'a> {
         // we save a full grid scan, lock acquisition, and shape
         // rebuild. Schedule a wake so we don't fall idle behind a
         // dirty bit that'll keep firing.
+        // 50ms, matching the embedder's own terminal clock. Every one of these
+        // wakes repaints the whole surface the terminal sits on — a pod table,
+        // a resource tree — so the two clocks running at different rates just
+        // meant the faster one paid for both. 20fps is well past what reading
+        // streamed text needs.
         const RENDER_THROTTLE: std::time::Duration =
-            std::time::Duration::from_millis(33);
+            std::time::Duration::from_millis(50);
         let recently_rendered = state
             .last_render_at
             .map(|t| t.elapsed() < RENDER_THROTTLE)
@@ -1182,7 +1217,7 @@ impl<'a> TerminalView<'a> {
                         RectShape::stroke(
                             cursor_rect,
                             CornerRadius::default(),
-                            Stroke::new(1.0, cursor_color),
+                            Stroke::new(1.0_f32, cursor_color),
                             egui::StrokeKind::Inside,
                         )
                     };
@@ -1225,7 +1260,7 @@ impl<'a> TerminalView<'a> {
             let start = *cm.start();
             let end = *cm.end();
             let border_color = egui::Color32::from_rgb(255, 180, 50);
-            let stroke = Stroke::new(2.0, border_color);
+            let stroke = Stroke::new(2.0_f32, border_color);
 
             // Screen paint row for a grid line. Identity path keeps
             // the original `line + display_offset` formula; filter
@@ -1510,6 +1545,7 @@ impl<'a> TerminalView<'a> {
         state.cached_current_match = self.current_match_start;
         state.cached_filter_active = self.line_filter.is_some();
         state.cached_filter_offset = rendered_filter_offset;
+        state.cached_display_offset = display_offset;
         state.last_render_at = Some(std::time::Instant::now());
         state.had_highlights = has_any_highlights;
         painter.extend(shapes);
@@ -1875,42 +1911,59 @@ fn filter_selection_target(
     Some((rows[row], col, right_side))
 }
 
-/// Convert a wheel event into scroll lines (positive = scroll up),
-/// accumulating sub-line pixel deltas in `state.scroll_pixels`.
-/// Shared by the raw-grid path (`process_mouse_wheel`) and the
-/// grep/filter path (which moves `filter_offset` instead).
-fn wheel_scroll_lines(
+/// Rows one wheel notch travels.
+///
+/// X11 reports a notch as a single line, so an unscaled notch moved the
+/// view one row — next to a text editor or a browser, both of which
+/// cover several lines per notch, that is not smoothness, it is just
+/// slow. Three is the long-standing terminal convention (xterm, and
+/// every libvte terminal) and roughly matches what an editor does.
+const ROWS_PER_NOTCH: f32 = 3.0;
+
+/// Bank a wheel event's distance in pixels, to be spent by the frame
+/// loop. Shared by the raw grid and the grep/filter view, which move
+/// different offsets but scroll at the same cadence.
+fn bank_wheel_pixels(
     state: &mut TerminalViewState,
-    font_size: f32,
+    cell_height: f32,
     unit: MouseWheelUnit,
     delta: Vec2,
-) -> i32 {
+) {
     match unit {
+        // A notch is a count of lines; convert to pixels so the frame
+        // loop can pay it out gradually.
         MouseWheelUnit::Line => {
-            (delta.y.signum() * delta.y.abs().ceil()) as i32
+            state.scroll_pixels -= delta.y * ROWS_PER_NOTCH * cell_height
         },
-        MouseWheelUnit::Point => {
-            state.scroll_pixels -= delta.y;
-            let lines = (state.scroll_pixels / font_size).trunc();
-            state.scroll_pixels %= font_size;
-            -lines as i32
-        },
-        MouseWheelUnit::Page => 0,
+        // A trackpad already reports the distance the finger travelled;
+        // scaling that would overshoot what the user asked for.
+        MouseWheelUnit::Point => state.scroll_pixels -= delta.y,
+        MouseWheelUnit::Page => {},
     }
 }
 
-fn process_mouse_wheel(
+/// How many rows to spend this frame, taken out of the bank.
+///
+/// Not the whole bank, and not a single row either: a flick of ten
+/// notches would crawl for a second at one row a frame, and a single
+/// notch spent whole is the jump we are trying to avoid. A third of
+/// what is left, at least one row, drains fast when there is a lot and
+/// eases out at the end — the shape a browser's scroll animation has.
+fn drain_banked_scroll(
     state: &mut TerminalViewState,
-    font_size: f32,
-    unit: MouseWheelUnit,
-    delta: Vec2,
-) -> InputAction {
-    let lines = wheel_scroll_lines(state, font_size, unit, delta);
-    if lines != 0 {
-        InputAction::BackendCall(BackendCommand::Scroll(lines))
-    } else {
-        InputAction::Ignore
+    cell_height: f32,
+) -> i32 {
+    if cell_height <= 0.0 {
+        state.scroll_pixels = 0.0;
+        return 0;
     }
+    let banked = (state.scroll_pixels / cell_height).trunc();
+    if banked == 0.0 {
+        return 0;
+    }
+    let step = (banked.abs() / 3.0).ceil().max(1.0) * banked.signum();
+    state.scroll_pixels -= step * cell_height;
+    -step as i32
 }
 
 fn process_button_click(
