@@ -65,6 +65,10 @@ pub type SelectionType = AlacrittySelectionType;
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
     Write(Vec<u8>),
+    /// Move the local viewport by `delta` rows (positive = up, into
+    /// the scrollback). Never writes to the PTY: keyboard paging and
+    /// programmatic jumps must not type into the running program. A
+    /// wheel notch goes through `WheelScroll` instead.
     Scroll(i32),
     Resize(Size, Size),
     SelectStart(SelectionType, f32, f32),
@@ -78,6 +82,12 @@ pub enum BackendCommand {
     SelectUpdateAtPoint(Point, Side),
     ProcessLink(LinkAction, Point),
     MouseReport(MouseButton, Modifiers, Point, bool),
+    /// Wheel travel of `delta` rows (positive = up) with the pointer at
+    /// the given grid `Point`. Routed like alacritty's
+    /// `scroll_terminal`: to the program as wheel mouse reports when it
+    /// tracks the mouse, as arrow keys under alternate scroll on the
+    /// alt screen, otherwise as a local viewport move.
+    WheelScroll(i32, Modifiers, Point),
 }
 
 #[derive(Debug, Clone)]
@@ -511,10 +521,14 @@ impl TerminalBackend {
                 // band gets painted, but the underlying grid bytes
                 // didn't change — match Points are still where they
                 // were. Don't bump `content_revision`, otherwise
-                // mouse-wheel scrolling kicks `search_all` once a
-                // second for no reason.
+                // scrolling kicks `search_all` once a second for no
+                // reason.
                 self.dirty.store(true, Ordering::Release);
-                self.scroll(&mut term, delta);
+                term.grid_mut().scroll_display(Scroll::Delta(delta));
+            },
+            BackendCommand::WheelScroll(delta, modifiers, point) => {
+                self.dirty.store(true, Ordering::Release);
+                self.wheel_scroll(&mut term, delta, modifiers, point);
             },
             BackendCommand::Resize(layout_size, font_size) => {
                 // resize() sets dirty only when grid dimensions change
@@ -545,7 +559,14 @@ impl TerminalBackend {
             },
             BackendCommand::MouseReport(button, modifiers, point, pressed) => {
                 self.dirty.store(true, Ordering::Release);
-                self.process_mouse_report(button, modifiers, point, pressed);
+                self.process_mouse_report(
+                    *term.mode(),
+                    button,
+                    modifiers,
+                    point,
+                    pressed,
+                    1,
+                );
             },
         };
     }
@@ -1107,13 +1128,27 @@ impl TerminalBackend {
         }
     }
 
+    /// Encode one mouse report and write it `count` times as a single
+    /// PTY write. A wheel flick can be dozens of rows in one frame; one
+    /// write keeps that to one channel send (on a pod exec session,
+    /// one WebSocket frame) instead of one per row.
     fn process_mouse_report(
         &self,
+        mode: TermMode,
         button: MouseButton,
         modifiers: Modifiers,
         point: Point,
         pressed: bool,
+        count: usize,
     ) {
+        // A pointer over scrollback rows (view scrolled back) maps to a
+        // negative line. The encoders only bound the line from above,
+        // and the normal encoding would wrap `line as u8`; alacritty's
+        // `mouse_report` drops such a report too.
+        if point.line.0 < 0 {
+            return;
+        }
+
         let mut mods = 0;
         if modifiers.contains(Modifiers::SHIFT) {
             mods += 4;
@@ -1125,44 +1160,46 @@ impl TerminalBackend {
             mods += 16;
         }
 
-        match MouseMode::from(self.last_content().terminal_mode) {
+        let report = match MouseMode::from(mode) {
             MouseMode::Sgr => {
-                self.sgr_mouse_report(point, button as u8 + mods, pressed)
+                Self::sgr_mouse_report(point, button as u8 + mods, pressed)
             },
             MouseMode::Normal(is_utf8) => {
                 if pressed {
-                    self.normal_mouse_report(
+                    Self::normal_mouse_report(
                         point,
                         button as u8 + mods,
                         is_utf8,
                     )
                 } else {
-                    self.normal_mouse_report(point, 3 + mods, is_utf8)
+                    Self::normal_mouse_report(point, 3 + mods, is_utf8)
                 }
             },
+        };
+        if report.is_empty() {
+            return;
         }
+        self.sink.notify(report.repeat(count));
     }
 
-    fn sgr_mouse_report(&self, point: Point, button: u8, pressed: bool) {
+    fn sgr_mouse_report(point: Point, button: u8, pressed: bool) -> Vec<u8> {
         let c = if pressed { 'M' } else { 'm' };
-
-        let msg = format!(
+        format!(
             "\x1b[<{};{};{}{}",
             button,
             point.column + 1,
             point.line + 1,
             c
-        );
-
-        self.sink.notify(msg.as_bytes().to_vec());
+        )
+        .into_bytes()
     }
 
-    fn normal_mouse_report(&self, point: Point, button: u8, is_utf8: bool) {
+    fn normal_mouse_report(point: Point, button: u8, is_utf8: bool) -> Vec<u8> {
         let Point { line, column } = point;
         let max_point = if is_utf8 { 2015 } else { 223 };
 
         if line >= max_point || column >= max_point {
-            return;
+            return Vec::new();
         }
 
         let mut msg = vec![b'\x1b', b'[', b'M', 32 + button];
@@ -1186,7 +1223,7 @@ impl TerminalBackend {
             msg.push(32 + 1 + line.0 as u8);
         }
 
-        self.sink.notify(msg);
+        msg
     }
 
     fn start_selection(
@@ -1302,26 +1339,55 @@ impl TerminalBackend {
         self.sink.notify(input);
     }
 
-    fn scroll(&mut self, terminal: &mut Term<EventProxy>, delta_value: i32) {
-        if delta_value != 0 {
-            let scroll = Scroll::Delta(delta_value);
-            if terminal
-                .mode()
-                .contains(TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN)
-            {
-                let line_cmd = if delta_value > 0 { b'A' } else { b'B' };
-                let mut content = vec![];
-
-                for _ in 0..delta_value.abs() {
-                    content.push(0x1b);
-                    content.push(b'O');
-                    content.push(line_cmd);
-                }
-
-                self.sink.notify(content);
+    /// Route wheel travel the way alacritty's `scroll_terminal` does.
+    /// The old `scroll()` never consulted `MOUSE_MODE`, so every notch on
+    /// the alt screen became `ESC O A/B` even for a program that tracks
+    /// the mouse. The mode is read live under the lock, not from
+    /// `last_content`: that snapshot only refreshes on the next render
+    /// sync, and routing off it would let a program that has just
+    /// switched tracking on still receive arrow keys for a frame.
+    fn wheel_scroll(
+        &self,
+        terminal: &mut Term<EventProxy>,
+        delta: i32,
+        modifiers: Modifiers,
+        point: Point,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        let mode = *terminal.mode();
+        // The wheel bank keeps `delta` to a few rows a frame; the clamp
+        // is for the public variant, where `i32::MIN` would otherwise
+        // `repeat` a report into gigabytes.
+        let rows = (delta.unsigned_abs() as usize)
+            .min(terminal.screen_lines() * 4)
+            .max(1);
+        // `intersects`, not `contains`: the three tracking modes are
+        // mutually exclusive, so `MOUSE_MODE` as a whole is never set.
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            // The program owns the wheel: one report per row, press
+            // only (a release would encode as button 3).
+            let button = if delta > 0 {
+                MouseButton::ScrollUp
             } else {
-                terminal.grid_mut().scroll_display(scroll);
-            }
+                MouseButton::ScrollDown
+            };
+            self.process_mouse_report(
+                mode, button, modifiers, point, true, rows,
+            );
+        } else if mode
+            .contains(TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN)
+        {
+            // Alternate scroll: the alt screen has no scrollback, so a
+            // notch becomes arrow keys for the program to page with.
+            // alacritty skips this for Shift+wheel and scrolls the grid
+            // instead; on the alt screen that is a no-op, so the
+            // exception is deliberately not mirrored here.
+            let line_cmd = if delta > 0 { b'A' } else { b'B' };
+            self.sink.notify([0x1b, b'O', line_cmd].repeat(rows));
+        } else {
+            terminal.grid_mut().scroll_display(Scroll::Delta(delta));
         }
     }
 
@@ -2059,5 +2125,122 @@ mod tests {
         assert!(!backend.pty_size_held());
         handle.resize_rx.try_recv().expect("one winsize");
         assert!(handle.resize_rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    fn headless() -> (TerminalBackend, DirectHandle) {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel::<(u64, PtyEvent)>();
+        TerminalBackend::new_direct(1, ctx, tx).expect("headless backend")
+    }
+
+    fn origin() -> Point {
+        Point::new(Line(0), Column(0))
+    }
+
+    fn wheel(backend: &mut TerminalBackend, delta: i32) {
+        backend.process_command(BackendCommand::WheelScroll(
+            delta,
+            Modifiers::NONE,
+            origin(),
+        ));
+    }
+
+    fn click(backend: &mut TerminalBackend, point: Point) {
+        backend.process_command(BackendCommand::MouseReport(
+            MouseButton::LeftButton,
+            Modifiers::NONE,
+            point,
+            true,
+        ));
+    }
+
+    #[test]
+    fn mouse_tracking_gets_one_report_per_row_in_one_write() {
+        let (mut backend, handle) = headless();
+        handle.writer.write(b"\x1b[?1003h");
+        wheel(&mut backend, 3);
+        let up = [0x1b, b'[', b'M', 96, 33, 33];
+        assert_eq!(handle.input_rx.try_recv().unwrap(), up.repeat(3));
+        assert!(handle.input_rx.try_recv().is_err(), "one write, not three");
+        wheel(&mut backend, -1);
+        assert_eq!(
+            handle.input_rx.try_recv().unwrap(),
+            vec![0x1b, b'[', b'M', 97, 33, 33]
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_tracking_gets_sgr_wheel_reports() {
+        let (mut backend, handle) = headless();
+        handle.writer.write(b"\x1b[?1003h\x1b[?1006h");
+        wheel(&mut backend, 1);
+        assert_eq!(
+            handle.input_rx.try_recv().unwrap(),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn mouse_tracking_wins_over_alternate_scroll() {
+        let (mut backend, handle) = headless();
+        handle.writer.write(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+        wheel(&mut backend, 1);
+        assert_eq!(
+            handle.input_rx.try_recv().unwrap(),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn alt_screen_without_mouse_tracking_gets_arrow_keys() {
+        let (mut backend, handle) = headless();
+        handle.writer.write(b"\x1b[?1049h");
+        wheel(&mut backend, 2);
+        assert_eq!(
+            handle.input_rx.try_recv().unwrap(),
+            b"\x1bOA\x1bOA".to_vec()
+        );
+        wheel(&mut backend, -1);
+        assert_eq!(handle.input_rx.try_recv().unwrap(), b"\x1bOB".to_vec());
+    }
+
+    #[test]
+    fn scroll_never_writes_to_the_pty() {
+        let (mut backend, handle) = headless();
+        handle.writer.write(b"\x1b[?1049h");
+        backend.process_command(BackendCommand::Scroll(i32::MIN / 2));
+        backend.process_command(BackendCommand::Scroll(40));
+        assert!(handle.input_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_screen_wheel_moves_the_viewport_only() {
+        let (mut backend, handle) = headless();
+        for i in 0..100 {
+            handle.writer.write(format!("line {i}\r\n").as_bytes());
+        }
+        wheel(&mut backend, 1);
+        assert_eq!(backend.display_offset(), 1);
+        assert!(handle.input_rx.try_recv().is_err());
+        backend.process_command(BackendCommand::Scroll(i32::MIN / 2));
+        assert_eq!(backend.display_offset(), 0);
+    }
+
+    #[test]
+    fn reports_above_the_viewport_are_dropped() {
+        let (mut backend, handle) = headless();
+        handle.writer.write(b"\x1b[?1003h");
+        click(&mut backend, Point::new(Line(-1), Column(0)));
+        assert!(handle.input_rx.try_recv().is_err());
+        click(&mut backend, origin());
+        assert_eq!(
+            handle.input_rx.try_recv().unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
     }
 }
