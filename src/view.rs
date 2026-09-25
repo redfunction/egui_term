@@ -42,6 +42,8 @@ enum InputAction {
 pub struct TerminalViewState {
     is_dragged: bool,
     scroll_pixels: f32,
+    /// Modifiers of the wheel event(s) that filled `scroll_pixels`.
+    scroll_modifiers: Modifiers,
     current_mouse_position_on_grid: TerminalGridPoint,
     scrollbar_dragging: bool,
     /// Y offset from click point to thumb top, so thumb doesn't snap on grab
@@ -487,10 +489,65 @@ impl<'a> TerminalView<'a> {
                     }
                 },
                 // Mouse wheel: require pointer over widget
-                egui::Event::MouseWheel { unit, delta, .. } => {
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers: wheel_modifiers,
+                } => {
                     if !has_pointer {
                         continue;
                     }
+                    // Ctrl/Cmd+wheel is the embedder's zoom binding. egui
+                    // reports it as `zoom_delta` and leaves the event in
+                    // place, so without this a notch would zoom *and*
+                    // scroll — or, under mouse tracking, reach the program
+                    // as a Ctrl-wheel report. A binding wins over both the
+                    // grid and the program, as in alacritty. Same predicate
+                    // egui uses for the zoom (`matches_any(COMMAND)`, i.e.
+                    // ctrl or cmd on every platform), so the two agree.
+                    if wheel_modifiers.matches_any(Modifiers::COMMAND) {
+                        continue;
+                    }
+                    // Reports are paid out over several frames; carry the
+                    // modifiers the notch was made with, not whatever is
+                    // held when a later frame spends the remainder.
+                    state.scroll_modifiers = wheel_modifiers;
+                    let tracking = self
+                        .backend
+                        .last_content()
+                        .terminal_mode
+                        .intersects(TermMode::MOUSE_MODE);
+                    // A wheel event carries no position, and the grid
+                    // point is otherwise refreshed only on PointerMoved:
+                    // it is (0, 0) until the pointer first moves inside
+                    // this widget. A program that routes the wheel by
+                    // cell (tmux panes, k9s split views) would scroll the
+                    // wrong pane, so take it from the hover position now.
+                    // Skipped under the grep/filter remap, where the
+                    // pixel→grid mapping does not hold (see PointerMoved).
+                    if !filter_active {
+                        if let Some(pos) = layout.hover_pos() {
+                            let content = self.backend.last_content();
+                            state.current_mouse_position_on_grid =
+                                TerminalBackend::selection_point(
+                                    pos.x - layout.rect.min.x,
+                                    pos.y - layout.rect.min.y,
+                                    &content.terminal_size,
+                                    content.display_offset,
+                                );
+                        }
+                    }
+                    // Under mouse tracking a notch is relayed to the
+                    // program one report per row, so it is worth one row
+                    // (alacritty forces its multiplier to 1 there) and the
+                    // program applies its own scroll speed. This snapshot
+                    // is only a hint; the routing itself reads the live
+                    // mode in the backend.
+                    let rows_per_notch = if tracking && !filter_active {
+                        1.0
+                    } else {
+                        ROWS_PER_NOTCH
+                    };
                     // Bank the distance; the frame loop below spends it.
                     // Nothing is emitted here, so several events landing in
                     // one frame cannot stack into a single jump.
@@ -499,6 +556,7 @@ impl<'a> TerminalView<'a> {
                         self.font.font_type().size,
                         unit,
                         delta,
+                        rows_per_notch,
                     );
                 },
                 // Mouse button: require pointer over widget (or dragging for release)
@@ -630,8 +688,13 @@ impl<'a> TerminalView<'a> {
                     state.filter_offset =
                         state.filter_offset.saturating_add_signed(lines as isize);
                 } else {
-                    self.backend
-                        .process_command(BackendCommand::Scroll(lines));
+                    // Not `Scroll`: only the wheel may become mouse
+                    // reports or alternate-scroll arrow keys.
+                    self.backend.process_command(BackendCommand::WheelScroll(
+                        lines,
+                        state.scroll_modifiers,
+                        state.current_mouse_position_on_grid,
+                    ));
                 }
             }
             layout.ctx.request_repaint();
@@ -1911,29 +1974,33 @@ fn filter_selection_target(
     Some((rows[row], col, right_side))
 }
 
-/// Rows one wheel notch travels.
+/// Rows one wheel notch travels when the view itself scrolls.
 ///
 /// X11 reports a notch as a single line, so an unscaled notch moved the
 /// view one row — next to a text editor or a browser, both of which
 /// cover several lines per notch, that is not smoothness, it is just
 /// slow. Three is the long-standing terminal convention (xterm, and
 /// every libvte terminal) and roughly matches what an editor does.
+/// Under mouse tracking the notch is relayed to the program instead and
+/// is worth one row; see the wheel arm in `process_input`.
 const ROWS_PER_NOTCH: f32 = 3.0;
 
 /// Bank a wheel event's distance in pixels, to be spent by the frame
 /// loop. Shared by the raw grid and the grep/filter view, which move
-/// different offsets but scroll at the same cadence.
+/// different offsets but scroll at the same cadence. `rows_per_notch`
+/// is what a `Line`-unit notch is worth.
 fn bank_wheel_pixels(
     state: &mut TerminalViewState,
     cell_height: f32,
     unit: MouseWheelUnit,
     delta: Vec2,
+    rows_per_notch: f32,
 ) {
     match unit {
         // A notch is a count of lines; convert to pixels so the frame
         // loop can pay it out gradually.
         MouseWheelUnit::Line => {
-            state.scroll_pixels -= delta.y * ROWS_PER_NOTCH * cell_height
+            state.scroll_pixels -= delta.y * rows_per_notch * cell_height
         },
         // A trackpad already reports the distance the finger travelled;
         // scaling that would overshoot what the user asked for.
@@ -2278,5 +2345,39 @@ mod filter_tests {
             .is_none());
         assert!(filter_selection_target(&[1], 5.0, 5.0, 8.0, 10.0, 0, 0)
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::{bank_wheel_pixels, TerminalViewState, ROWS_PER_NOTCH};
+    use egui::{MouseWheelUnit, Vec2};
+
+    #[test]
+    fn bank_scales_a_line_notch_by_one_row() {
+        let mut state = TerminalViewState::default();
+        let notch_up = Vec2::new(0.0, 1.0);
+        bank_wheel_pixels(
+            &mut state,
+            10.0,
+            MouseWheelUnit::Line,
+            notch_up,
+            1.0,
+        );
+        assert_eq!(state.scroll_pixels, -10.0);
+    }
+
+    #[test]
+    fn bank_scales_a_line_notch_by_rows_per_notch() {
+        let mut state = TerminalViewState::default();
+        let notch_up = Vec2::new(0.0, 1.0);
+        bank_wheel_pixels(
+            &mut state,
+            10.0,
+            MouseWheelUnit::Line,
+            notch_up,
+            ROWS_PER_NOTCH,
+        );
+        assert_eq!(state.scroll_pixels, -30.0);
     }
 }
