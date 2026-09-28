@@ -41,6 +41,10 @@ enum InputAction {
 #[derive(Clone, Default)]
 pub struct TerminalViewState {
     is_dragged: bool,
+    /// The current drag is a Shift+drag selection over a program that tracks
+    /// the mouse (the xterm/Alacritty override): its moves and release belong
+    /// to the selection, not to the program, even if Shift is let go mid-drag.
+    shift_selecting: bool,
     scroll_pixels: f32,
     /// Modifiers of the wheel event(s) that filled `scroll_pixels`.
     scroll_modifiers: Modifiers,
@@ -408,8 +412,24 @@ impl<'a> TerminalView<'a> {
         let has_focus = layout.has_focus();
         let has_pointer = layout.contains_pointer();
 
-        if !has_focus && !has_pointer {
+        // A drag that started here is still ours after the pointer leaves:
+        // returning early dropped the release that ended it, so an unfocused
+        // terminal kept extending its selection on every later hover.
+        if !has_focus && !has_pointer && !state.is_dragged {
             return self;
+        }
+        // And if the release never reaches us at all (it happened outside the
+        // window), the button being up is enough to end the drag.
+        if state.is_dragged
+            && !layout.ctx.input(|i| {
+                i.pointer.primary_down()
+                    || i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::PointerButton { .. }))
+            })
+        {
+            state.is_dragged = false;
+            state.shift_selecting = false;
         }
 
         // Stop egui's focus system from stealing Tab / arrow keys /
@@ -798,10 +818,13 @@ impl<'a> TerminalView<'a> {
             .last_render_at
             .map(|t| t.elapsed() < RENDER_THROTTLE)
             .unwrap_or(false);
+        // Not while a selection is being dragged: the cached shapes hold the
+        // old highlight, so the selection trailed the pointer at 20fps.
         if recently_rendered
             && cache_key_matches
             && !state.scrollbar_dragging
             && !pointer_on_scrollbar
+            && !state.is_dragged
         {
             if let Some(ref shapes) = state.cached_shapes {
                 painter.extend(shapes.clone());
@@ -2067,7 +2090,12 @@ fn process_left_button(
     pressed: bool,
 ) -> InputAction {
     let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
+    // Shift+drag selects even when the program tracks the mouse — the override
+    // xterm and Alacritty give. Without it, text inside k9s, htop, tmux or vim
+    // with the mouse on, or an agent CLI, could not be selected at all. The
+    // release goes the way the press went, whatever Shift is doing by then.
+    let mouse_mode = terminal_mode.intersects(TermMode::MOUSE_MODE);
+    if reports_left_button(mouse_mode, pressed, modifiers.shift, state.shift_selecting) {
         InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
@@ -2075,6 +2103,7 @@ fn process_left_button(
             pressed,
         ))
     } else if pressed {
+        state.shift_selecting = mouse_mode;
         process_left_button_pressed(state, layout, position)
     } else {
         process_left_button_released(
@@ -2086,6 +2115,22 @@ fn process_left_button(
             modifiers,
         )
     }
+}
+
+/// Whether a left press or release goes to the program as a mouse report
+/// (`true`) or drives the selection (`false`).
+///
+/// A program that tracks the mouse gets it — unless the press held Shift, the
+/// override xterm and Alacritty give so text can still be selected. The
+/// release follows its press (`shift_selecting`), not Shift's state by then.
+fn reports_left_button(
+    mouse_mode: bool,
+    pressed: bool,
+    shift: bool,
+    shift_selecting: bool,
+) -> bool {
+    let override_to_select = if pressed { shift } else { shift_selecting };
+    mouse_mode && !override_to_select
 }
 
 fn process_left_button_pressed(
@@ -2106,6 +2151,7 @@ fn process_left_button_released(
     modifiers: &Modifiers,
 ) -> InputAction {
     state.is_dragged = false;
+    state.shift_selecting = false;
     if layout.double_clicked() || layout.triple_clicked() {
         InputAction::BackendCall(build_start_select_command(layout, position))
     } else {
@@ -2169,6 +2215,7 @@ fn process_mouse_move(
         let terminal_mode = terminal_content.terminal_mode;
         let cmd = if terminal_mode.contains(TermMode::MOUSE_MOTION)
             && modifiers.is_none()
+            && !state.shift_selecting
         {
             InputAction::BackendCall(BackendCommand::MouseReport(
                 MouseButton::LeftMove,
@@ -2204,6 +2251,42 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod left_button_tests {
+    use super::reports_left_button;
+
+    #[test]
+    fn without_mouse_tracking_the_left_button_always_selects() {
+        for (pressed, shift, selecting) in
+            [(true, false, false), (true, true, false), (false, false, false)]
+        {
+            assert!(!reports_left_button(false, pressed, shift, selecting));
+        }
+    }
+
+    #[test]
+    fn a_program_tracking_the_mouse_gets_a_plain_press() {
+        assert!(reports_left_button(true, true, false, false));
+        assert!(reports_left_button(true, false, false, false), "and its release");
+    }
+
+    /// The override: Shift+press selects even when the program tracks the
+    /// mouse (k9s, htop, tmux, vim with the mouse on, agent CLIs).
+    #[test]
+    fn shift_press_selects_over_mouse_tracking() {
+        assert!(!reports_left_button(true, true, true, false));
+    }
+
+    /// The release follows its press: letting go of Shift first still ends
+    /// the selection, and a Shift held at the release of a reported press
+    /// still reports.
+    #[test]
+    fn the_release_goes_the_way_its_press_went() {
+        assert!(!reports_left_button(true, false, false, true));
+        assert!(reports_left_button(true, false, true, false));
+    }
 }
 
 #[cfg(test)]
