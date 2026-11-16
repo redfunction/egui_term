@@ -27,6 +27,8 @@ const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 #[derive(Clone, Copy, PartialEq)]
 enum HighlightKind {
     None,
+    /// A kept term (`set_highlights`), in its colour.
+    Term(egui::Color32),
     Match,
     Current,
 }
@@ -145,6 +147,9 @@ pub struct TerminalView<'a> {
     bindings_layout: BindingsLayout,
     /// Regex for search highlighting (searched on visible area each frame).
     search_regex: Option<RegexSearch>,
+    /// Kept terms, each painted in its own colour under the search's
+    /// matches (`set_highlights`).
+    highlights: Vec<(RegexSearch, egui::Color32)>,
     /// The absolute point of the "current" match start (highlighted differently).
     current_match_start: Option<TerminalGridPoint>,
     /// When true, keyboard input is not sent to the terminal (log/read-only mode).
@@ -232,6 +237,7 @@ impl<'a> TerminalView<'a> {
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
             search_regex: None,
+            highlights: Vec::new(),
             current_match_start: None,
             read_only: false,
             hide_cursor: false,
@@ -311,6 +317,20 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_search(mut self, regex: Option<RegexSearch>) -> Self {
         self.search_regex = regex;
+        self
+    }
+
+    /// Terms kept highlighted, each in its own colour — painted on every
+    /// visible match, under the search's own matches (the search wins
+    /// where both match; the first term wins where terms overlap).
+    /// The widget cannot tell when they change: fold them into
+    /// `set_search_key`.
+    #[inline]
+    pub fn set_highlights(
+        mut self,
+        highlights: Vec<(RegexSearch, egui::Color32)>,
+    ) -> Self {
+        self.highlights = highlights;
         self
     }
 
@@ -1130,8 +1150,38 @@ impl<'a> TerminalView<'a> {
             };
             expand_match_into_cells(m, term_columns, target);
         }
-        let has_any_highlights =
-            !current_cells.is_empty() || !highlight_cells.is_empty();
+        // Kept terms: the same bounded scans as the search, each cell
+        // taking the first term's colour that covers it.
+        let mut term_cells: std::collections::BTreeMap<
+            TerminalGridPoint,
+            egui::Color32,
+        > = std::collections::BTreeMap::new();
+        if !self.highlights.is_empty() {
+            let scan_min = visible_min_col.max(0) as usize;
+            let scan_max =
+                visible_max_col.max(visible_min_col) as usize;
+            for (regex, color) in self.highlights.iter_mut() {
+                let found = if let Some(ref rows) = filter_rows {
+                    crate::backend::regex_matches_on_lines(
+                        &terminal, regex, rows, scan_min, scan_max,
+                    )
+                } else {
+                    crate::backend::visible_regex_match_iter_in_cols(
+                        &terminal, regex, scan_min, scan_max, 5,
+                    )
+                };
+                for m in found {
+                    let mut cells = std::collections::BTreeSet::new();
+                    expand_match_into_cells(m, term_columns, &mut cells);
+                    for p in cells {
+                        term_cells.entry(p).or_insert(*color);
+                    }
+                }
+            }
+        }
+        let has_any_highlights = !current_cells.is_empty()
+            || !highlight_cells.is_empty()
+            || !term_cells.is_empty();
 
         // Manual iteration over only visible rows × visible cols.
         // `display_iter` walks every cell of the grid (~26k yields
@@ -1212,6 +1262,8 @@ impl<'a> TerminalView<'a> {
                         HighlightKind::Current
                     } else if highlight_cells.contains(&point) {
                         HighlightKind::Match
+                    } else if let Some(color) = term_cells.get(&point) {
+                        HighlightKind::Term(*color)
                     } else {
                         HighlightKind::None
                     }
@@ -1263,6 +1315,10 @@ impl<'a> TerminalView<'a> {
                 HighlightKind::Match => {
                     bg = egui::Color32::from_rgb(180, 160, 60); // yellow for other matches
                     fg = egui::Color32::BLACK;
+                }
+                HighlightKind::Term(color) => {
+                    bg = color;
+                    fg = readable_on(color);
                 }
                 HighlightKind::None => {}
             }
@@ -1712,6 +1768,18 @@ fn round_rect_int(r: egui::Rect) -> egui::Rect {
 /// Expand an inclusive grid-point range into a set of every cell it
 /// covers, line-by-line. Used to flatten search-match ranges into a
 /// BTreeSet so the per-cell highlight check during render is O(log n).
+/// Black or white, whichever reads on `bg`.
+fn readable_on(bg: egui::Color32) -> egui::Color32 {
+    let luma = 0.299 * bg.r() as f32
+        + 0.587 * bg.g() as f32
+        + 0.114 * bg.b() as f32;
+    if luma > 140.0 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 fn expand_match_into_cells(
     range: std::ops::RangeInclusive<TerminalGridPoint>,
     term_columns: usize,
@@ -2462,5 +2530,23 @@ mod wheel_tests {
             ROWS_PER_NOTCH,
         );
         assert_eq!(state.scroll_pixels, -30.0);
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::readable_on;
+    use egui::Color32;
+
+    #[test]
+    fn text_on_a_kept_term_reads_on_its_colour() {
+        assert_eq!(
+            readable_on(Color32::from_rgb(250, 220, 90)),
+            Color32::BLACK
+        );
+        assert_eq!(
+            readable_on(Color32::from_rgb(40, 60, 160)),
+            Color32::WHITE
+        );
     }
 }
