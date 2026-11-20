@@ -146,7 +146,7 @@ pub struct TerminalView<'a> {
     theme: TerminalTheme,
     bindings_layout: BindingsLayout,
     /// Regex for search highlighting (searched on visible area each frame).
-    search_regex: Option<RegexSearch>,
+    search_regex: Option<&'a mut RegexSearch>,
     /// Kept terms, each painted in its own colour under the search's
     /// matches (`set_highlights`).
     highlights: &'a mut [(RegexSearch, egui::Color32)],
@@ -314,8 +314,10 @@ impl<'a> TerminalView<'a> {
     }
 
     /// Set a search regex for highlighting visible matches each frame.
+    /// Lent, not given, as `set_highlights`: the caller keeps it from frame
+    /// to frame, so its lazy DFA stays warm.
     #[inline]
-    pub fn set_search(mut self, regex: Option<RegexSearch>) -> Self {
+    pub fn set_search(mut self, regex: Option<&'a mut RegexSearch>) -> Self {
         self.search_regex = regex;
         self
     }
