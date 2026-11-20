@@ -149,7 +149,7 @@ pub struct TerminalView<'a> {
     search_regex: Option<RegexSearch>,
     /// Kept terms, each painted in its own colour under the search's
     /// matches (`set_highlights`).
-    highlights: Vec<(RegexSearch, egui::Color32)>,
+    highlights: &'a mut [(RegexSearch, egui::Color32)],
     /// The absolute point of the "current" match start (highlighted differently).
     current_match_start: Option<TerminalGridPoint>,
     /// When true, keyboard input is not sent to the terminal (log/read-only mode).
@@ -237,7 +237,7 @@ impl<'a> TerminalView<'a> {
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
             search_regex: None,
-            highlights: Vec::new(),
+            highlights: &mut [],
             current_match_start: None,
             read_only: false,
             hide_cursor: false,
@@ -324,11 +324,13 @@ impl<'a> TerminalView<'a> {
     /// visible match, under the search's own matches (the search wins
     /// where both match; the first term wins where terms overlap).
     /// The widget cannot tell when they change: fold them into
-    /// `set_search_key`.
+    /// `set_search_key`. Lent, not given: the caller keeps them from frame
+    /// to frame, so each regex's lazy DFA stays warm instead of a cold copy
+    /// being built every frame.
     #[inline]
     pub fn set_highlights(
         mut self,
-        highlights: Vec<(RegexSearch, egui::Color32)>,
+        highlights: &'a mut [(RegexSearch, egui::Color32)],
     ) -> Self {
         self.highlights = highlights;
         self
